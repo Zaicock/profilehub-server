@@ -1,13 +1,64 @@
-const jwt = require("jsonwebtoken");
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 const cors = require('cors');
-
+const jwt = require("jsonwebtoken");
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+app.post("/api/register", (req, res) => {
+  const { username, email, password } = req.body;
+
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: "بيانات ناقصة" });
+  }
+
+  const user = {
+    id: "u_" + Date.now(),
+    username,
+    email,
+    role: "user",
+    createdAt: new Date().toISOString()
+  };
+
+  const token = jwt.sign(user, JWT_SECRET, {
+    expiresIn: "7d"
+  });
+
+  res.json({
+    token,
+    user
+  });
+});
+
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "بيانات ناقصة" });
+  }
+
+  // (مؤقت) جلب المستخدم
+  const user = {
+    id: "u_123456",
+    username: "User",
+    email,
+    role: "user",
+    createdAt: new Date().toISOString()
+  };
+
+  const token = jwt.sign(user, JWT_SECRET, {
+    expiresIn: "7d"
+  });
+
+  res.json({
+    token,
+    user
+  });
+});
+
 
 // مهم لـ Railway
 app.set('trust proxy', true);
