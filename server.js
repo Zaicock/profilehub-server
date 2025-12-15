@@ -14,6 +14,9 @@ app.use(cors());
 app.use(express.json());
 app.set("trust proxy", true);
 
+// ================== تخزين مؤقت ==================
+const registeredUsers = new Map(); // userId => user
+
 // ================== API ==================
 
 // إنشاء حساب
@@ -22,6 +25,13 @@ app.post("/api/register", (req, res) => {
 
   if (!username || !email || !password) {
     return res.status(400).json({ error: "بيانات ناقصة" });
+  }
+
+  // تحقق من الاسم
+  for (const u of registeredUsers.values()) {
+    if (u.username === username) {
+      return res.status(409).json({ error: "اسم المستخدم مستخدم بالفعل" });
+    }
   }
 
   const user = {
@@ -34,6 +44,8 @@ app.post("/api/register", (req, res) => {
     )}&background=007AFF&color=fff`,
     createdAt: new Date().toISOString()
   };
+
+  registeredUsers.set(user.id, user);
 
   const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
   res.json({ token, user });
@@ -48,17 +60,83 @@ app.post("/api/login", (req, res) => {
   }
 
   // مؤقت (لاحقاً DB)
-  const user = {
-    id: "u_123456",
-    username: "User",
-    email,
-    role: "user",
-    avatar: `https://ui-avatars.com/api/?name=User&background=007AFF&color=fff`,
-    createdAt: new Date().toISOString()
-  };
+  let user = Array.from(registeredUsers.values()).find(u => u.email === email);
+
+  if (!user) {
+    user = {
+      id: "u_" + Date.now(),
+      username: "User",
+      email,
+      role: "user",
+      avatar: `https://ui-avatars.com/api/?name=User&background=007AFF&color=fff`,
+      createdAt: new Date().toISOString()
+    };
+    registeredUsers.set(user.id, user);
+  }
 
   const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
   res.json({ token, user });
+});
+
+// ================== Middleware ==================
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: "غير مصرح" });
+
+  const token = auth.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "توكن مفقود" });
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: "توكن غير صالح" });
+  }
+}
+
+// ================== تحديث البروفايل ==================
+app.post("/api/profile/update", authMiddleware, (req, res) => {
+  const { username, avatar } = req.body;
+  const userId = req.user.id;
+
+  const currentUser = registeredUsers.get(userId);
+  if (!currentUser) {
+    return res.status(404).json({ error: "المستخدم غير موجود" });
+  }
+
+  // تحقق من الاسم
+  if (username) {
+    for (const u of registeredUsers.values()) {
+      if (u.username === username && u.id !== userId) {
+        return res.status(409).json({
+          error: "اسم المستخدم مستخدم بالفعل"
+        });
+      }
+    }
+  }
+
+  if (username) currentUser.username = username;
+  if (avatar) currentUser.avatar = avatar;
+
+  registeredUsers.set(userId, currentUser);
+
+  // بث التحديث
+  rooms.forEach((_, roomId) => {
+    broadcast(roomId, {
+      type: "profile-updated",
+      user: {
+        id: currentUser.id,
+        username: currentUser.username,
+        avatar: currentUser.avatar
+      },
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  res.json({
+    success: true,
+    user: currentUser
+  });
 });
 
 // ================== HTTP Server ==================
@@ -96,7 +174,6 @@ wss.on("connection", (ws, req) => {
   const roomId = url.searchParams.get("room") || "global";
   const token = url.searchParams.get("token");
 
-  // منع أي اتصال بدون توكن
   if (!token) {
     ws.close();
     return;
@@ -105,7 +182,7 @@ wss.on("connection", (ws, req) => {
   let user;
   try {
     user = jwt.verify(token, JWT_SECRET);
-  } catch (err) {
+  } catch {
     ws.close();
     return;
   }
@@ -116,7 +193,6 @@ wss.on("connection", (ws, req) => {
 
   console.log(`📡 CONNECT | ${user.username} | room=${roomId}`);
 
-  // ===== ترحيب =====
   ws.send(
     JSON.stringify({
       type: "welcome",
@@ -126,14 +202,12 @@ wss.on("connection", (ws, req) => {
     })
   );
 
-  // ===== إشعار انضمام =====
   broadcast(roomId, {
     type: "user-joined",
     user,
     timestamp: new Date().toISOString()
   });
 
-  // ===== استقبال الرسائل =====
   ws.on("message", raw => {
     let data;
     try {
@@ -143,6 +217,13 @@ wss.on("connection", (ws, req) => {
     }
 
     if (!data.text) return;
+
+    // تحديث البيانات من التخزين
+    const updatedUser = registeredUsers.get(user.id);
+    if (updatedUser) {
+      user.username = updatedUser.username;
+      user.avatar = updatedUser.avatar;
+    }
 
     const message = {
       type: "new-message",
@@ -160,7 +241,6 @@ wss.on("connection", (ws, req) => {
     broadcast(roomId, message);
   });
 
-  // ===== مغادرة =====
   ws.on("close", () => {
     room.delete(ws);
     users.delete(ws);
