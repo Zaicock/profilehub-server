@@ -7,146 +7,158 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// مهم لـ Railway
+app.set('trust proxy', true);
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-const rooms = new Map();
-const users = new Map();
+// ===== تخزين مؤقت =====
+const rooms = new Map(); // roomId => Set<ws>
+const users = new Map(); // ws => userInfo
 
-wss.on('connection', (ws, req) => {
-  const url = req.url;
-  let roomId = 'global';
-  
-  if (url.includes('/ws/')) {
-    roomId = url.split('/ws/')[1] || 'global';
-  }
-  
-  console.log(`📡 مستخدم جديد متصل: ${roomId}`);
-  
+// ===== أدوات =====
+function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, new Set());
   }
-  
+  return rooms.get(roomId);
+}
+
+function broadcast(roomId, data) {
   const room = rooms.get(roomId);
+  if (!room) return;
+
+  const payload = JSON.stringify(data);
+  room.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  });
+}
+
+function createUser(ws, roomId, payload = {}) {
+  return {
+    id: payload.userId || `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    username: payload.username || 'مستخدم',
+    avatar:
+      payload.avatar ||
+      `https://ui-avatars.com/api/?name=${encodeURIComponent(payload.username || 'User')}&background=007AFF&color=fff`,
+    roomId
+  };
+}
+
+// ===== WebSocket =====
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const roomId = url.searchParams.get('room') || 'global';
+
+  const room = getRoom(roomId);
   room.add(ws);
-  
-  const userId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-  users.set(ws, { id: userId, roomId });
-  
+
+  const user = createUser(ws, roomId);
+  users.set(ws, user);
+
+  console.log(`📡 اتصال جديد | room=${roomId} | user=${user.id}`);
+
+  // ترحيب
   ws.send(JSON.stringify({
     type: 'welcome',
-    message: 'مرحباً في الدردشة!',
     room: roomId,
+    user,
     timestamp: new Date().toISOString()
   }));
-  
-  const joinMessage = {
+
+  // إشعار دخول
+  broadcast(roomId, {
     type: 'user-joined',
-    userId: userId,
-    username: 'مستخدم جديد',
-    room: roomId,
+    user,
     timestamp: new Date().toISOString()
-  };
-  
-  room.forEach(client => {
-    if (client !== ws && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(joinMessage));
-    }
   });
-  
-  ws.on('message', (message) => {
+
+  // استقبال الرسائل
+  ws.on('message', raw => {
+    let data;
     try {
-      const data = JSON.parse(message);
-      console.log('📩 رسالة واردة:', data);
-      
-      const userInfo = users.get(ws);
-      const broadcastData = {
-        type: 'new-message',
-        userId: data.userId || userInfo?.id || 'unknown',
-        username: data.username || 'مستخدم',
-        avatar: data.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(data.username || 'مستخدم')}&background=007AFF&color=fff`,
-        text: data.text,
-        room: data.room || roomId,
-        timestamp: data.timestamp || new Date().toISOString()
-      };
-      
-      room.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(broadcastData));
-        }
-      });
-      
-    } catch (error) {
-      console.error('❌ خطأ في معالجة الرسالة:', error);
-      ws.send(JSON.stringify({
+      data = JSON.parse(raw.toString());
+    } catch {
+      return ws.send(JSON.stringify({
         type: 'error',
-        message: 'خطأ في معالجة الرسالة'
+        message: 'صيغة الرسالة غير صحيحة'
       }));
     }
+
+    if (!data.text) return;
+
+    const msg = {
+      type: 'new-message',
+      user: {
+        id: user.id,
+        username: data.username || user.username,
+        avatar: data.avatar || user.avatar
+      },
+      text: data.text,
+      room: roomId,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log('📩 رسالة:', msg.text);
+
+    broadcast(roomId, msg);
+
+    // ⬅️ هنا لاحقاً نضيف منطق البوت كنظام
   });
-  
+
   ws.on('close', () => {
-    console.log(`👋 مستخدم غادر: ${roomId}`);
-    
-    const userInfo = users.get(ws);
-    if (userInfo) {
-      const leaveMessage = {
-        type: 'user-left',
-        userId: userInfo.id,
-        username: 'مستخدم',
-        room: userInfo.roomId,
-        timestamp: new Date().toISOString()
-      };
-      
-      const userRoom = rooms.get(userInfo.roomId);
-      if (userRoom) {
-        userRoom.forEach(client => {
-          if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(leaveMessage));
-          }
-        });
-        
-        userRoom.delete(ws);
-        if (userRoom.size === 0) {
-          rooms.delete(userInfo.roomId);
-        }
-      }
-      
-      users.delete(ws);
+    console.log(`👋 غادر المستخدم | ${user.id}`);
+
+    room.delete(ws);
+    users.delete(ws);
+
+    broadcast(roomId, {
+      type: 'user-left',
+      userId: user.id,
+      room: roomId,
+      timestamp: new Date().toISOString()
+    });
+
+    if (room.size === 0) {
+      rooms.delete(roomId);
     }
   });
-  
-  ws.on('error', (error) => {
-    console.error('💥 خطأ WebSocket:', error);
+
+  ws.on('error', err => {
+    console.error('💥 WebSocket Error:', err);
   });
 });
 
+// ===== HTTP =====
 app.get('/', (req, res) => {
-  const roomStats = {};
-  rooms.forEach((clients, roomId) => {
-    roomStats[roomId] = clients.size;
+  const stats = {};
+  rooms.forEach((set, roomId) => {
+    stats[roomId] = set.size;
   });
-  
+
   res.json({
     status: 'running',
-    message: 'ProfileHub WebSocket Server',
-    timestamp: new Date().toISOString(),
+    rooms: stats,
     totalRooms: rooms.size,
-    totalConnections: Array.from(rooms.values()).reduce((sum, set) => sum + set.size, 0),
-    rooms: roomStats
+    totalUsers: Array.from(rooms.values()).reduce((a, b) => a + b.size, 0),
+    timestamp: new Date().toISOString()
   });
 });
 
 app.get('/status', (req, res) => {
   res.json({
     status: 'online',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
   });
 });
 
+// ===== تشغيل =====
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 خادم ProfileHub يعمل على المنفذ ${PORT}`);
-  console.log(`🌐 WebSocket: ws://localhost:${PORT}/ws/{roomId}`);
+  console.log(`🚀 ProfileHub Server on ${PORT}`);
+  console.log(`🔌 WS: /ws?room=global`);
 });
