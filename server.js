@@ -1,3 +1,5 @@
+const jwt = require("jsonwebtoken");
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
