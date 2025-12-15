@@ -12,8 +12,6 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// مهم لـ Railway
 app.set("trust proxy", true);
 
 // ================== API ==================
@@ -31,12 +29,13 @@ app.post("/api/register", (req, res) => {
     username,
     email,
     role: "user",
-    avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=007AFF&color=fff`,
+    avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(
+      username
+    )}&background=007AFF&color=fff`,
     createdAt: new Date().toISOString()
   };
 
   const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-
   res.json({ token, user });
 });
 
@@ -48,7 +47,7 @@ app.post("/api/login", (req, res) => {
     return res.status(400).json({ error: "بيانات ناقصة" });
   }
 
-  // مؤقت – لاحقاً من DB
+  // مؤقت (لاحقاً DB)
   const user = {
     id: "u_123456",
     username: "User",
@@ -59,7 +58,6 @@ app.post("/api/login", (req, res) => {
   };
 
   const token = jwt.sign(user, JWT_SECRET, { expiresIn: "7d" });
-
   res.json({ token, user });
 });
 
@@ -69,7 +67,7 @@ const server = http.createServer(app);
 // ================== WebSocket ==================
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
-// تخزين مؤقت
+// ===== تخزين =====
 const rooms = new Map(); // roomId => Set<ws>
 const users = new Map(); // ws => user
 
@@ -98,7 +96,7 @@ wss.on("connection", (ws, req) => {
   const roomId = url.searchParams.get("room") || "global";
   const token = url.searchParams.get("token");
 
-  // ❌ لا اتصال بدون توكن
+  // منع أي اتصال بدون توكن
   if (!token) {
     ws.close();
     return;
@@ -114,26 +112,28 @@ wss.on("connection", (ws, req) => {
 
   const room = getRoom(roomId);
   room.add(ws);
-  users.set(ws, { ...user, roomId });
+  users.set(ws, user);
 
-  console.log(`📡 WS CONNECT | ${user.username} | room=${roomId}`);
+  console.log(`📡 CONNECT | ${user.username} | room=${roomId}`);
 
-  // ترحيب
-  ws.send(JSON.stringify({
-    type: "welcome",
-    room: roomId,
-    user,
-    timestamp: new Date().toISOString()
-  }));
+  // ===== ترحيب =====
+  ws.send(
+    JSON.stringify({
+      type: "welcome",
+      room: roomId,
+      user,
+      timestamp: new Date().toISOString()
+    })
+  );
 
-  // إشعار دخول
+  // ===== إشعار انضمام =====
   broadcast(roomId, {
     type: "user-joined",
     user,
     timestamp: new Date().toISOString()
   });
 
-  // استقبال الرسائل
+  // ===== استقبال الرسائل =====
   ws.on("message", raw => {
     let data;
     try {
@@ -144,11 +144,72 @@ wss.on("connection", (ws, req) => {
 
     if (!data.text) return;
 
-    const msg = {
+    const message = {
       type: "new-message",
       user: {
         id: user.id,
         username: user.username,
         avatar: user.avatar
       },
-     
+      text: data.text,
+      room: roomId,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log(`💬 ${user.username}: ${data.text}`);
+    broadcast(roomId, message);
+  });
+
+  // ===== مغادرة =====
+  ws.on("close", () => {
+    room.delete(ws);
+    users.delete(ws);
+
+    console.log(`👋 LEAVE | ${user.username}`);
+
+    broadcast(roomId, {
+      type: "user-left",
+      userId: user.id,
+      room: roomId,
+      timestamp: new Date().toISOString()
+    });
+
+    if (room.size === 0) {
+      rooms.delete(roomId);
+    }
+  });
+
+  ws.on("error", err => {
+    console.error("💥 WS ERROR:", err);
+  });
+});
+
+// ================== Status ==================
+app.get("/", (req, res) => {
+  const stats = {};
+  rooms.forEach((set, roomId) => {
+    stats[roomId] = set.size;
+  });
+
+  res.json({
+    status: "running",
+    rooms: stats,
+    totalRooms: rooms.size,
+    totalUsers: Array.from(rooms.values()).reduce((a, b) => a + b.size, 0),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/status", (req, res) => {
+  res.json({
+    status: "online",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ================== تشغيل ==================
+server.listen(PORT, () => {
+  console.log(`🚀 ProfileHub Server running on ${PORT}`);
+  console.log(`🔌 WS: /ws?room=global&token=JWT`);
+});
