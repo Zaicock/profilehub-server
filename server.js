@@ -1,18 +1,46 @@
 const express = require('express');
+const WebSocket = require('ws');
+const http = require('http');
 const cors = require('cors');
-const app = express();
 
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.send(`<h1>خادم ProfileHub على Railway 🚂</h1><p>${new Date()}</p>`);
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// تخزين المستخدمين المتصلين
+const connectedUsers = new Map();
+
+wss.on('connection', (ws, req) => {
+  const roomId = req.url.split('/ws/')[1] || 'global';
+  
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      
+      // إعادة بث الرسالة لجميع المستخدمين في نفس الغرفة
+      wss.clients.forEach((client) => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({
+            type: 'new-message',
+            ...data
+          }));
+        }
+      });
+    } catch (error) {
+      console.error('Error processing message:', error);
+    }
+  });
 });
 
-app.post('/api/send', (req, res) => {
-  console.log('📨 رسالة:', req.body);
-  res.json({ success: true, server: 'railway', time: new Date() });
+// نقطة نهاية للتحقق من صحة الخادم
+app.get('/', (req, res) => {
+  res.send('ProfileHub WebSocket Server is running');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ يعمل على ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
