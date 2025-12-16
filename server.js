@@ -469,45 +469,75 @@ app.post(["/api/register", "/auth/register"], async (req, res) => {
 });
 
 app.post(["/api/login", "/auth/login"], async (req, res) => {
-  const { email, password } = req.body;
+  try {
+    const { email, password } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_FIELDS"
+      });
+    }
+
+    const identifier = email.trim().toLowerCase();
+    const isEmail = identifier.includes("@");
+
+    const user = await dbOne(
+      isEmail
+        ? "SELECT * FROM users WHERE email = ? LIMIT 1"
+        : "SELECT * FROM users WHERE username = ? LIMIT 1",
+      [identifier]
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        ok: false,
+        error: "BAD_CREDENTIALS"
+      });
+    }
+
+    if (user.banned) {
+      return res.status(403).json({
+        ok: false,
+        error: "BANNED"
+      });
+    }
+
+    const valid = verifyPassword(password, user.pass_hash);
+    if (!valid) {
+      return res.status(401).json({
+        ok: false,
+        error: "BAD_CREDENTIALS"
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        username: user.username,
+        is_developer: !!user.is_developer
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        is_developer: !!user.is_developer
+      }
+    });
+
+  } catch (err) {
+    console.error("LOGIN ERROR:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "SERVER_ERROR"
+    });
   }
-
-  const isEmail = email.includes("@");
-
-  const user = await dbOne(
-    isEmail
-      ? "SELECT * FROM users WHERE email=? LIMIT 1"
-      : "SELECT * FROM users WHERE username=? LIMIT 1",
-    [login.trim().toLowerCase()]
-  );
-
-  if (!user) {
-    return res.status(401).json({ ok: false, error: "BAD_CREDENTIALS" });
-  }
-
-  if (user.banned) {
-    return res.status(403).json({ ok: false, error: "BANNED" });
-  }
-
-  const valid = verifyPassword(password, user.pass_hash);
-  if (!valid) {
-    return res.status(401).json({ ok: false, error: "BAD_CREDENTIALS" });
-  }
-
-  const token = jwt.sign(
-    {
-      id: user.id,
-      username: user.username,
-      is_developer: !!user.is_developer
-    },
-    JWT_SECRET,
-    { expiresIn: "7d" }
-  );
-
-  res.json({ ok: true, token });
 });
 
 app.get("/api/me", authMiddleware, async (req, res) => {
