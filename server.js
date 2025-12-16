@@ -1,1208 +1,1144 @@
-const express = require('express');
-const http = require('http');
-const socketIo = require('socket.io');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const mysql = require('mysql2/promise');
+/**
+ * FULL SINGLE-FILE SERVER
+ * Express + WebSocket + MySQL (Railway auto) + JWT
+ * Features:
+ * - Auth: register/login/me
+ * - Rooms: create/join/leave/list + owner/dev roles + transfer ownership
+ * - Members list live updates (online/typing)
+ * - Chat: send/edit/delete
+ * - Auto-delete messages after N (room setting)
+ * - Moderation: mute/ban/restrict chat, kick
+ * - Points: give/charge + transactions
+ * - Labels: developer can set label + color for user in room
+ * - WebRTC signaling: seats + offer/answer/ice via WS (voice rooms)
+ */
 
-// إنشاء تطبيق Express
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const mysql = require("mysql2/promise");
+const crypto = require("crypto");
+
+/* ================== APP ================== */
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-// تكوين Socket.io مع CORS
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  transports: ['websocket', 'polling']
-});
+/* ================== DB AUTO DETECT ================== */
+function parseDbUrl(url) {
+  const u = new URL(url);
+  return {
+    host: u.hostname,
+    port: u.port ? Number(u.port) : 3306,
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    database: u.pathname.replace("/", ""),
+  };
+}
 
-// تكوين CORS للتطبيق
-app.use(cors({
-  origin: "*",
-  credentials: true
-}));
+function getDbConfigFromEnv() {
+  // Railway plugin vars
+  if (
+    process.env.MYSQLHOST &&
+    process.env.MYSQLUSER &&
+    process.env.MYSQLPASSWORD &&
+    process.env.MYSQLDATABASE
+  ) {
+    return {
+      host: process.env.MYSQLHOST,
+      port: process.env.MYSQLPORT ? Number(process.env.MYSQLPORT) : 3306,
+      user: process.env.MYSQLUSER,
+      password: process.env.MYSQLPASSWORD,
+      database: process.env.MYSQLDATABASE,
+    };
+  }
+  // URL style
+  const url = process.env.DATABASE_URL || process.env.MYSQL_URL;
+  if (url) return parseDbUrl(url);
+  return null;
+}
 
-// معالجة JSON
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// ========== معالجة Railway Environment Variables ==========
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || process.env.RAILWAY_JWT_SECRET || 'your-jwt-secret-key-change-this';
-
-// تأكد من وجود متغيرات البيئة المطلوبة
-if (!process.env.MYSQLHOST || !process.env.MYSQLUSER || !process.env.MYSQLPASSWORD || !process.env.MYSQLDATABASE) {
-  console.error('❌ خطأ: متغيرات قاعدة البيانات مفقودة في بيئة Railway');
-  console.error('يرجى تعيين MYSQLHOST, MYSQLUSER, MYSQLPASSWORD, MYSQLDATABASE');
+const baseDb = getDbConfigFromEnv();
+if (!baseDb) {
+  console.error("❌ DB config not found. Set MYSQLHOST.. or DATABASE_URL");
   process.exit(1);
 }
 
-// تكوين اتصال قاعدة البيانات مباشرة من Railway
 const DB_CONFIG = {
-  host: process.env.MYSQLHOST,
-  port: process.env.MYSQLPORT || 3306,
-  user: process.env.MYSQLUSER,
-  password: process.env.MYSQLPASSWORD,
-  database: process.env.MYSQLDATABASE,
+  ...baseDb,
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: 15,
   queueLimit: 0,
-  ssl: process.env.MYSQL_SSL === 'true' ? { rejectUnauthorized: false } : false
+  ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : false,
 };
 
-// إنشاء تجمع اتصالات قاعدة البيانات
 let pool;
-async function initializeDatabase() {
+
+/* ================== JWT SECRET (ENV OR DB) ================== */
+let JWT_SECRET = process.env.JWT_SECRET || null;
+
+async function ensureJwtSecret() {
+  if (JWT_SECRET) return JWT_SECRET;
+
+  const [rows] = await pool.execute(
+    "SELECT setting_value FROM server_settings WHERE setting_key=? LIMIT 1",
+    ["jwt_secret"]
+  );
+
+  if (rows.length && rows[0].setting_value) {
+    JWT_SECRET = rows[0].setting_value;
+    return JWT_SECRET;
+  }
+
+  JWT_SECRET = crypto.randomBytes(48).toString("hex");
+  await pool.execute(
+    "INSERT INTO server_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)",
+    ["jwt_secret", JWT_SECRET]
+  );
+  console.log("🔐 JWT_SECRET generated & stored in DB");
+  return JWT_SECRET;
+}
+
+/* ================== HELPERS ================== */
+function sha256(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+
+function nowIso() {
+  return new Date().toISOString().slice(0, 19).replace("T", " ");
+}
+
+function safeJsonParse(s) {
   try {
-    pool = mysql.createPool(DB_CONFIG);
-    
-    // اختبار الاتصال بقاعدة البيانات
-    const connection = await pool.getConnection();
-    console.log('✅ تم الاتصال بقاعدة البيانات بنجاح');
-    connection.release();
-    
-    // إنشاء الجداول إذا لم تكن موجودة
-    await createTablesIfNotExist();
-    
-  } catch (error) {
-    console.error('❌ خطأ في الاتصال بقاعدة البيانات:', error.message);
-    console.error('تأكد من أن متغيرات Railway صحيحة وأن قاعدة البيانات قيد التشغيل');
-    process.exit(1);
+    return JSON.parse(s);
+  } catch {
+    return null;
   }
 }
 
-// ========== إنشاء الجداول إذا لم تكن موجودة ==========
+function mustInt(n, def = 0) {
+  const x = Number(n);
+  return Number.isFinite(x) ? Math.trunc(x) : def;
+}
+
+async function dbOne(sql, params) {
+  const [rows] = await pool.execute(sql, params);
+  return rows && rows.length ? rows[0] : null;
+}
+
+/* ================== TABLES ================== */
 async function createTablesIfNotExist() {
-  const tables = [
-    `CREATE TABLE IF NOT EXISTS users (
-      id VARCHAR(36) PRIMARY KEY,
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS server_settings (
+      setting_key VARCHAR(100) PRIMARY KEY,
+      setting_value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY,
       username VARCHAR(50) UNIQUE NOT NULL,
       email VARCHAR(100) UNIQUE NOT NULL,
-      password_hash VARCHAR(255) NOT NULL,
-      role ENUM('owner', 'developer', 'member', 'admin') DEFAULT 'member',
+      pass_hash VARCHAR(255) NOT NULL,
+      is_developer TINYINT DEFAULT 0,
       points INT DEFAULT 0,
-      verified BOOLEAN DEFAULT FALSE,
-      banned BOOLEAN DEFAULT FALSE,
-      subscription_level ENUM('free', 'premium', 'vip') DEFAULT 'free',
-      subscription_end_date DATETIME,
-      referral_code VARCHAR(20) UNIQUE,
-      referred_by VARCHAR(36),
-      avatar_url TEXT,
-      badges JSON DEFAULT '[]',
-      custom_badges JSON DEFAULT '[]',
-      settings JSON DEFAULT '{}',
-      last_seen DATETIME,
+      banned TINYINT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS rooms (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(80) NOT NULL,
+      type ENUM('text','voice') DEFAULT 'text',
+      owner_user_id INT NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_username (username),
-      INDEX idx_email (email),
-      INDEX idx_role (role)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS profiles (
-      id VARCHAR(36) PRIMARY KEY,
-      user_id VARCHAR(36) UNIQUE NOT NULL,
-      name VARCHAR(100),
-      bio TEXT,
-      avatar_url TEXT,
-      frame_id VARCHAR(36),
-      name_color VARCHAR(7) DEFAULT '#007AFF',
-      animated_name BOOLEAN DEFAULT FALSE,
-      bg_color VARCHAR(7) DEFAULT '#667eea',
-      text_effect VARCHAR(50),
-      button_style VARCHAR(50) DEFAULT 'gradient',
-      links JSON DEFAULT '[]',
-      images JSON DEFAULT '[]',
-      views INT DEFAULT 0,
-      followers INT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_user_id (user_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS rooms (
-      id VARCHAR(36) PRIMARY KEY,
-      name VARCHAR(100) NOT NULL,
-      description TEXT,
-      icon VARCHAR(10),
-      owner_id VARCHAR(36) NOT NULL,
-      type ENUM('public', 'private', 'premium') DEFAULT 'public',
-      price INT DEFAULT 0,
-      max_members INT DEFAULT 100,
-      current_members INT DEFAULT 0,
-      auto_delete_limit INT DEFAULT 1000,
-      chat_locked BOOLEAN DEFAULT FALSE,
-      voice_seats_count INT DEFAULT 8,
-      voice_enabled BOOLEAN DEFAULT TRUE,
-      settings JSON DEFAULT '{}',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_owner_id (owner_id),
-      INDEX idx_type (type)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS room_members (
-      id VARCHAR(36) PRIMARY KEY,
-      room_id VARCHAR(36) NOT NULL,
-      user_id VARCHAR(36) NOT NULL,
-      role ENUM('owner', 'admin', 'moderator', 'member') DEFAULT 'member',
+      FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS room_members (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      room_id INT NOT NULL,
+      user_id INT NOT NULL,
+      role ENUM('owner','developer','member') DEFAULT 'member',
+      muted_until DATETIME NULL,
+      restricted TINYINT DEFAULT 0,
+      banned TINYINT DEFAULT 0,
       joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      muted_until DATETIME,
-      banned BOOLEAN DEFAULT FALSE,
-      UNIQUE KEY unique_room_user (room_id, user_id),
+      UNIQUE KEY uniq_room_user (room_id, user_id),
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_room_id (room_id),
-      INDEX idx_user_id (user_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS messages (
-      id VARCHAR(36) PRIMARY KEY,
-      room_id VARCHAR(36) NOT NULL,
-      user_id VARCHAR(36) NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS room_settings (
+      room_id INT PRIMARY KEY,
+      auto_delete_limit INT DEFAULT 0,
+      chat_disabled TINYINT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      room_id INT NOT NULL,
+      user_id INT NOT NULL,
       text TEXT NOT NULL,
-      type ENUM('text', 'image', 'system', 'command') DEFAULT 'text',
-      metadata JSON DEFAULT '{}',
-      edited_at DATETIME,
-      deleted_at DATETIME,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      edited_at DATETIME NULL,
+      deleted TINYINT DEFAULT 0,
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_room_id (room_id),
-      INDEX idx_user_id (user_id),
-      INDEX idx_created_at (created_at)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS frames (
-      id VARCHAR(36) PRIMARY KEY,
-      name VARCHAR(100) NOT NULL,
-      css_class VARCHAR(100) UNIQUE NOT NULL,
-      image_url TEXT,
-      type ENUM('css', 'image') DEFAULT 'css',
-      price INT DEFAULT 0,
-      category ENUM('basic', 'premium', 'special', 'exclusive') DEFAULT 'basic',
-      available BOOLEAN DEFAULT TRUE,
-      description TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_category (category),
-      INDEX idx_available (available)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS user_frames (
-      id VARCHAR(36) PRIMARY KEY,
-      user_id VARCHAR(36) NOT NULL,
-      frame_id VARCHAR(36) NOT NULL,
-      purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      expires_at DATETIME,
-      active BOOLEAN DEFAULT TRUE,
-      UNIQUE KEY unique_user_frame (user_id, frame_id),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
-      INDEX idx_user_id (user_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS bots (
-      id VARCHAR(36) PRIMARY KEY,
-      room_id VARCHAR(36) NOT NULL,
-      name VARCHAR(100) NOT NULL,
-      avatar_url TEXT,
-      owner_id VARCHAR(36) NOT NULL,
-      commands JSON DEFAULT '[]',
-      settings JSON DEFAULT '{}',
-      enabled BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_room_time (room_id, created_at)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS point_transactions (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      from_user_id INT NULL,
+      to_user_id INT NULL,
+      amount INT NOT NULL,
+      reason VARCHAR(150) NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS room_labels (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      room_id INT NOT NULL,
+      user_id INT NOT NULL,
+      label_text VARCHAR(40) NOT NULL,
+      label_color VARCHAR(20) DEFAULT '#ff3b30',
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_label (room_id, user_id),
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_room_id (room_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS voice_seats (
-      id VARCHAR(36) PRIMARY KEY,
-      room_id VARCHAR(36) NOT NULL,
-      seat_number INT NOT NULL,
-      user_id VARCHAR(36),
-      is_locked BOOLEAN DEFAULT FALSE,
-      is_muted BOOLEAN DEFAULT FALSE,
-      joined_at DATETIME,
-      UNIQUE KEY unique_room_seat (room_id, seat_number),
-      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
-      INDEX idx_room_id (room_id),
-      INDEX idx_user_id (user_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS subscriptions (
-      id VARCHAR(36) PRIMARY KEY,
-      user_id VARCHAR(36) NOT NULL,
-      plan_type ENUM('monthly', 'yearly', 'lifetime') NOT NULL,
-      payment_method VARCHAR(50),
-      transaction_id VARCHAR(100),
-      amount DECIMAL(10,2) NOT NULL,
-      status ENUM('active', 'expired', 'cancelled', 'pending') DEFAULT 'pending',
-      start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      end_date DATETIME,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_user_id (user_id),
-      INDEX idx_status (status)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS moderation_logs (
-      id VARCHAR(36) PRIMARY KEY,
-      room_id VARCHAR(36) NOT NULL,
-      target_user_id VARCHAR(36) NOT NULL,
-      moderator_id VARCHAR(36) NOT NULL,
-      action_type ENUM('mute', 'ban', 'kick', 'warn', 'restrict', 'chat_lock') NOT NULL,
-      reason TEXT,
-      duration_minutes INT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (target_user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (moderator_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_room_id (room_id),
-      INDEX idx_target_user_id (target_user_id)
-    )`,
-    
-    `CREATE TABLE IF NOT EXISTS user_points (
-      id VARCHAR(36) PRIMARY KEY,
-      user_id VARCHAR(36) NOT NULL,
-      points INT NOT NULL,
-      type ENUM('grant', 'deduct', 'purchase', 'reward') NOT NULL,
-      reason TEXT,
-      reference_id VARCHAR(36),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_user_id (user_id)
-    )`
-  ];
-  
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS room_seats (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      room_id INT NOT NULL,
+      seat_index INT NOT NULL,
+      user_id INT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_seat (room_id, seat_index),
+      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+    )
+  `);
+
+  console.log("✅ Tables ready");
+}
+
+/* ================== DB INIT ================== */
+async function initializeDatabase() {
+  pool = await mysql.createPool(DB_CONFIG);
+  await createTablesIfNotExist();
+  await ensureJwtSecret();
+}
+
+/* ================== AUTH MIDDLEWARE ================== */
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "NO_TOKEN" });
+
   try {
-    for (const tableSQL of tables) {
-      await pool.execute(tableSQL);
-    }
-    console.log('✅ تم إنشاء/تأكيد الجداول بنجاح');
-  } catch (error) {
-    console.error('❌ خطأ في إنشاء الجداول:', error);
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "BAD_TOKEN" });
   }
 }
 
-// ========== Middleware المصادقة ==========
-const authenticateToken = async (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+/* ================== PERMISSIONS ================== */
+async function getRoomAndMember(roomId, userId) {
+  const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
+  if (!room) return { room: null, member: null };
 
-  if (!token) {
-    return res.status(401).json({ error: 'توكن المصادقة مطلوب' });
-  }
+  const member = await dbOne(
+    "SELECT * FROM room_members WHERE room_id=? AND user_id=? LIMIT 1",
+    [roomId, userId]
+  );
+
+  return { room, member };
+}
+
+function roleRank(role) {
+  if (role === "owner") return 3;
+  if (role === "developer") return 2;
+  return 1;
+}
+
+function isMuted(member) {
+  if (!member || !member.muted_until) return false;
+  return new Date(member.muted_until).getTime() > Date.now();
+}
+
+/* ================== API ================== */
+
+// health
+app.get("/", (req, res) => res.send("OK"));
+
+// register
+app.post("/api/register", async (req, res) => {
+  const { username, email, password } = req.body || {};
+  if (!username || !email || !password)
+    return res.status(400).json({ error: "MISSING_FIELDS" });
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const [users] = await pool.execute(
-      'SELECT id, username, email, role, points, verified, banned, subscription_level, avatar_url, badges, custom_badges, settings FROM users WHERE id = ?',
-      [decoded.userId]
+    await pool.execute(
+      "INSERT INTO users (username,email,pass_hash) VALUES (?,?,?)",
+      [String(username).trim(), String(email).trim().toLowerCase(), sha256(password)]
     );
-
-    if (users.length === 0) {
-      return res.status(404).json({ error: 'المستخدم غير موجود' });
-    }
-
-    if (users[0].banned) {
-      return res.status(403).json({ error: 'الحساب محظور' });
-    }
-
-    req.user = users[0];
-    next();
-  } catch (error) {
-    return res.status(403).json({ error: 'توكن غير صالح' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: "USER_EXISTS" });
   }
-};
+});
 
-// ========== دوال المساعدة ==========
-function generateId() {
-  return 'xxxx-xxxx-xxxx-xxxx'.replace(/x/g, () => 
-    Math.floor(Math.random() * 16).toString(16)
+// login
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password)
+    return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const user = await dbOne(
+    "SELECT id,username,is_developer,points,banned FROM users WHERE email=? AND pass_hash=? LIMIT 1",
+    [String(email).trim().toLowerCase(), sha256(password)]
+  );
+
+  if (!user) return res.status(401).json({ error: "BAD_CREDENTIALS" });
+  if (user.banned) return res.status(403).json({ error: "BANNED" });
+
+  const token = jwt.sign(
+    {
+      id: user.id,
+      username: user.username,
+      is_developer: !!user.is_developer,
+    },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  res.json({ ok: true, token });
+});
+
+// me
+app.get("/api/me", authMiddleware, async (req, res) => {
+  const u = await dbOne(
+    "SELECT id,username,email,is_developer,points,banned,created_at FROM users WHERE id=? LIMIT 1",
+    [req.user.id]
+  );
+  res.json({ ok: true, user: u });
+});
+
+// rooms list
+app.get("/api/rooms", authMiddleware, async (req, res) => {
+  const [rows] = await pool.execute(
+    `SELECT r.*,
+      (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id AND rm.banned=0) AS members_count
+     FROM rooms r
+     ORDER BY r.id DESC
+     LIMIT 200`
+  );
+  res.json({ ok: true, rooms: rows });
+});
+
+// create room
+app.post("/api/rooms", authMiddleware, async (req, res) => {
+  const { name, type } = req.body || {};
+  const roomName = String(name || "").trim();
+  const roomType = type === "voice" ? "voice" : "text";
+  if (!roomName) return res.status(400).json({ error: "NAME_REQUIRED" });
+
+  const [r] = await pool.execute(
+    "INSERT INTO rooms (name,type,owner_user_id) VALUES (?,?,?)",
+    [roomName, roomType, req.user.id]
+  );
+  const roomId = r.insertId;
+
+  await pool.execute(
+    "INSERT INTO room_members (room_id,user_id,role) VALUES (?,?, 'owner')",
+    [roomId, req.user.id]
+  );
+  await pool.execute(
+    "INSERT INTO room_settings (room_id,auto_delete_limit,chat_disabled) VALUES (?,?,?)",
+    [roomId, 0, 0]
+  );
+
+  // init 8 seats for voice
+  if (roomType === "voice") {
+    const seats = [];
+    for (let i = 1; i <= 8; i++) seats.push([roomId, i, null]);
+    await pool.query(
+      "INSERT IGNORE INTO room_seats (room_id, seat_index, user_id) VALUES ?",
+      [seats]
+    );
+  }
+
+  res.json({ ok: true, room_id: roomId });
+});
+
+// room info
+app.get("/api/rooms/:id", authMiddleware, async (req, res) => {
+  const roomId = mustInt(req.params.id, 0);
+  const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
+  if (!room) return res.status(404).json({ error: "NOT_FOUND" });
+
+  const settings = await dbOne("SELECT * FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
+
+  const [members] = await pool.execute(
+    `SELECT rm.user_id, rm.role, rm.muted_until, rm.restricted, rm.banned,
+            u.username, u.is_developer, u.points,
+            rl.label_text, rl.label_color
+     FROM room_members rm
+     JOIN users u ON u.id=rm.user_id
+     LEFT JOIN room_labels rl ON rl.room_id=rm.room_id AND rl.user_id=rm.user_id
+     WHERE rm.room_id=?
+     ORDER BY FIELD(rm.role,'owner','developer','member'), rm.joined_at ASC`,
+    [roomId]
+  );
+
+  let seats = [];
+  if (room.type === "voice") {
+    const [s] = await pool.execute(
+      "SELECT seat_index, user_id FROM room_seats WHERE room_id=? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    seats = s;
+  }
+
+  res.json({ ok: true, room, settings, members, seats });
+});
+
+// messages fetch
+app.get("/api/rooms/:id/messages", authMiddleware, async (req, res) => {
+  const roomId = mustInt(req.params.id, 0);
+  const limit = Math.min(200, Math.max(1, mustInt(req.query.limit, 50)));
+  const beforeId = mustInt(req.query.before_id, 0);
+
+  let sql =
+    `SELECT m.id, m.room_id, m.user_id, m.text, m.created_at, m.edited_at, m.deleted,
+            u.username,
+            rl.label_text, rl.label_color
+     FROM messages m
+     JOIN users u ON u.id=m.user_id
+     LEFT JOIN room_labels rl ON rl.room_id=m.room_id AND rl.user_id=m.user_id
+     WHERE m.room_id=? `;
+  const params = [roomId];
+
+  if (beforeId > 0) {
+    sql += " AND m.id < ? ";
+    params.push(beforeId);
+  }
+
+  sql += " ORDER BY m.id DESC LIMIT ? ";
+  params.push(limit);
+
+  const [rows] = await pool.execute(sql, params);
+  res.json({ ok: true, messages: rows.reverse() });
+});
+
+// set auto-delete limit (owner/dev only)
+app.post("/api/rooms/:id/autodelete", authMiddleware, async (req, res) => {
+  const roomId = mustInt(req.params.id, 0);
+  const limit = mustInt(req.body?.limit, 0);
+
+  const { room, member } = await getRoomAndMember(roomId, req.user.id);
+  if (!room || !member) return res.status(404).json({ error: "NOT_FOUND_OR_NOT_MEMBER" });
+
+  if (roleRank(member.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
+
+  await pool.execute(
+    "UPDATE room_settings SET auto_delete_limit=? WHERE room_id=?",
+    [Math.max(0, Math.min(500, limit)), roomId]
+  );
+
+  res.json({ ok: true });
+});
+
+// toggle chat disabled (owner/dev)
+app.post("/api/rooms/:id/chat", authMiddleware, async (req, res) => {
+  const roomId = mustInt(req.params.id, 0);
+  const disabled = req.body?.disabled ? 1 : 0;
+
+  const { room, member } = await getRoomAndMember(roomId, req.user.id);
+  if (!room || !member) return res.status(404).json({ error: "NOT_FOUND_OR_NOT_MEMBER" });
+  if (roleRank(member.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
+
+  await pool.execute(
+    "UPDATE room_settings SET chat_disabled=? WHERE room_id=?",
+    [disabled, roomId]
+  );
+
+  res.json({ ok: true });
+});
+
+/* ================== WEBSOCKET ================== */
+
+const wss = new WebSocket.Server({ server });
+
+/**
+ * In-memory presence:
+ * ws => { userId, username, rooms:Set }
+ */
+const WS_STATE = new Map(); // ws -> state
+const ROOM_SOCKETS = new Map(); // roomId -> Set<ws>
+
+function roomSet(roomId) {
+  if (!ROOM_SOCKETS.has(roomId)) ROOM_SOCKETS.set(roomId, new Set());
+  return ROOM_SOCKETS.get(roomId);
+}
+
+function wsSend(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function broadcastRoom(roomId, obj) {
+  const set = ROOM_SOCKETS.get(roomId);
+  if (!set) return;
+  const msg = JSON.stringify(obj);
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  }
+}
+
+async function broadcastMembersSnapshot(roomId) {
+  const [members] = await pool.execute(
+    `SELECT rm.user_id, rm.role, rm.muted_until, rm.restricted, rm.banned,
+            u.username,
+            rl.label_text, rl.label_color
+     FROM room_members rm
+     JOIN users u ON u.id=rm.user_id
+     LEFT JOIN room_labels rl ON rl.room_id=rm.room_id AND rl.user_id=rm.user_id
+     WHERE rm.room_id=? AND rm.banned=0
+     ORDER BY FIELD(rm.role,'owner','developer','member'), rm.joined_at ASC`,
+    [roomId]
+  );
+
+  // presence online
+  const online = new Set();
+  for (const [ws, st] of WS_STATE.entries()) {
+    if (st.rooms?.has(roomId)) online.add(st.userId);
+  }
+
+  broadcastRoom(roomId, {
+    type: "members_snapshot",
+    room_id: roomId,
+    members: members.map((m) => ({
+      user_id: m.user_id,
+      username: m.username,
+      role: m.role,
+      muted_until: m.muted_until,
+      restricted: !!m.restricted,
+      label_text: m.label_text || null,
+      label_color: m.label_color || null,
+      online: online.has(m.user_id),
+    })),
+  });
+}
+
+async function broadcastSeats(roomId) {
+  const [s] = await pool.execute(
+    "SELECT seat_index, user_id FROM room_seats WHERE room_id=? ORDER BY seat_index ASC",
+    [roomId]
+  );
+  broadcastRoom(roomId, { type: "seats_snapshot", room_id: roomId, seats: s });
+}
+
+async function enforceAutoDelete(roomId) {
+  const settings = await dbOne("SELECT auto_delete_limit FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
+  const limit = mustInt(settings?.auto_delete_limit, 0);
+  if (!limit || limit <= 0) return;
+
+  // Count active (not deleted)
+  const row = await dbOne(
+    "SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND deleted=0",
+    [roomId]
+  );
+  const count = mustInt(row?.c, 0);
+  if (count <= limit) return;
+
+  const overflow = count - limit;
+
+  // delete oldest overflow messages
+  await pool.execute(
+    `UPDATE messages
+     SET deleted=1
+     WHERE room_id=? AND deleted=0
+     ORDER BY id ASC
+     LIMIT ?`,
+    [roomId, overflow]
+  );
+
+  broadcastRoom(roomId, {
+    type: "system",
+    room_id: roomId,
+    text: "تم حذف الرسائل لتوفير مساحة للدردشة",
+  });
+}
+
+async function requireWsAuth(ws) {
+  const st = WS_STATE.get(ws);
+  if (!st?.userId) return null;
+  // user must not be globally banned
+  const u = await dbOne("SELECT id, username, banned, is_developer FROM users WHERE id=? LIMIT 1", [st.userId]);
+  if (!u || u.banned) return null;
+  return u;
+}
+
+async function ensureMember(roomId, userId) {
+  const member = await dbOne(
+    "SELECT * FROM room_members WHERE room_id=? AND user_id=? LIMIT 1",
+    [roomId, userId]
+  );
+  return member;
+}
+
+async function ensureCanModerate(roomId, userId) {
+  const member = await ensureMember(roomId, userId);
+  if (!member) return false;
+  return roleRank(member.role) >= 2; // developer or owner
+}
+
+async function ensureCanOwner(roomId, userId) {
+  const member = await ensureMember(roomId, userId);
+  if (!member) return false;
+  return member.role === "owner";
+}
+
+async function setRoomLabel(roomId, targetUserId, text, color) {
+  await pool.execute(
+    `INSERT INTO room_labels (room_id, user_id, label_text, label_color)
+     VALUES (?,?,?,?)
+     ON DUPLICATE KEY UPDATE label_text=VALUES(label_text), label_color=VALUES(label_color)`,
+    [roomId, targetUserId, text, color]
   );
 }
 
-function generateReferralCode() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let code = '';
-  for (let i = 0; i < 8; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
+async function updatePoints(fromUserId, toUserId, amount, reason) {
+  const amt = mustInt(amount, 0);
+  if (!amt || amt === 0) return { ok: false, error: "BAD_AMOUNT" };
+
+  if (toUserId && amt > 0) {
+    // give points (deduct from sender)
+    const sender = await dbOne("SELECT points FROM users WHERE id=? LIMIT 1", [fromUserId]);
+    if (!sender) return { ok: false, error: "NO_SENDER" };
+    if (sender.points < amt) return { ok: false, error: "NO_BALANCE" };
+
+    await pool.execute("UPDATE users SET points=points-? WHERE id=?", [amt, fromUserId]);
+    await pool.execute("UPDATE users SET points=points+? WHERE id=?", [amt, toUserId]);
+  } else {
+    // charge (negative) or system add
+    // keep simple
   }
-  return code;
+
+  await pool.execute(
+    "INSERT INTO point_transactions (from_user_id,to_user_id,amount,reason) VALUES (?,?,?,?)",
+    [fromUserId || null, toUserId || null, amt, reason || null]
+  );
+
+  return { ok: true };
 }
 
-// ========== API Routes ==========
+wss.on("connection", (ws) => {
+  WS_STATE.set(ws, { userId: null, username: null, rooms: new Set() });
 
-// 1. المسار الرئيسي للتحقق من السيرفر
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'active', 
-    message: 'ProfileHub Server is running',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
-});
+  wsSend(ws, { type: "hello", server_time: Date.now() });
 
-// 2. تسجيل المستخدم الجديد
-app.post('/api/register', async (req, res) => {
-  try {
-    const { username, email, password, referralCode } = req.body;
+  ws.on("message", async (raw) => {
+    const msg = safeJsonParse(raw);
+    if (!msg || !msg.type) return;
 
-    // التحقق من البيانات
-    if (!username || !email || !password) {
-      return res.status(400).json({ error: 'جميع الحقول مطلوبة' });
-    }
-
-    // التحقق من أن المستخدم غير موجود
-    const [existingUsers] = await pool.execute(
-      'SELECT id FROM users WHERE username = ? OR email = ?',
-      [username, email]
-    );
-
-    if (existingUsers.length > 0) {
-      return res.status(409).json({ error: 'اسم المستخدم أو البريد الإلكتروني موجود بالفعل' });
-    }
-
-    // تجزئة كلمة المرور
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    const userId = generateId();
-    const userReferralCode = generateReferralCode();
-
-    // إنشاء المستخدم
-    await pool.execute(
-      `INSERT INTO users (id, username, email, password_hash, referral_code, points, created_at) 
-       VALUES (?, ?, ?, ?, ?, 1000, NOW())`,
-      [userId, username, email, passwordHash, userReferralCode]
-    );
-
-    // إنشاء البروفايل الافتراضي
-    await pool.execute(
-      `INSERT INTO profiles (id, user_id, name, avatar_url, created_at) 
-       VALUES (?, ?, ?, ?, NOW())`,
-      [generateId(), userId, username, `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=007AFF&color=fff&size=150`]
-    );
-
-    // منح نقاط الإحالة إذا كان هناك كود إحالة
-    if (referralCode) {
-      const [referrers] = await pool.execute(
-        'SELECT id FROM users WHERE referral_code = ?',
-        [referralCode]
-      );
-
-      if (referrers.length > 0) {
-        const referrerId = referrers[0].id;
-        
-        // تحديث نقاط المُحيل
-        await pool.execute(
-          'UPDATE users SET points = points + 500 WHERE id = ?',
-          [referrerId]
+    // AUTH
+    if (msg.type === "auth") {
+      try {
+        const token = String(msg.token || "");
+        const payload = jwt.verify(token, JWT_SECRET);
+        const u = await dbOne(
+          "SELECT id, username, banned, is_developer FROM users WHERE id=? LIMIT 1",
+          [payload.id]
         );
-
-        // تسجيل عملية النقاط
-        await pool.execute(
-          'INSERT INTO user_points (id, user_id, points, type, reason, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-          [generateId(), referrerId, 500, 'reward', 'مكافأة إحالة']
-        );
-
-        // تحديث المستخدم الجديد بالإحالة
-        await pool.execute(
-          'UPDATE users SET referred_by = ? WHERE id = ?',
-          [referrerId, userId]
-        );
-
-        // منح المستخدم الجديد نقاط إضافية
-        await pool.execute(
-          'UPDATE users SET points = points + 500 WHERE id = ?',
-          [userId]
-        );
-
-        await pool.execute(
-          'INSERT INTO user_points (id, user_id, points, type, reason, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-          [generateId(), userId, 500, 'reward', 'مكافأة التسجيل بكود دعوة']
-        );
-      }
-    }
-
-    // إنشاء التوكن
-    const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
-
-    // جلب بيانات المستخدم
-    const [users] = await pool.execute(
-      'SELECT id, username, email, role, points, verified, subscription_level, avatar_url FROM users WHERE id = ?',
-      [userId]
-    );
-
-    res.status(201).json({
-      message: 'تم إنشاء الحساب بنجاح',
-      token,
-      user: users[0]
-    });
-
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'خطأ في الخادم' });
-  }
-});
-
-// 3. تسجيل الدخول
-app.post('/api/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'البريد الإلكتروني وكلمة المرور مطلوبان' });
-    }
-
-    // البحث عن المستخدم
-    const [users] = await pool.execute(
-      'SELECT id, username, email, password_hash, role, points, verified, banned, subscription_level, avatar_url, badges, custom_badges FROM users WHERE email = ?',
-      [email]
-    );
-
-    if (users.length === 0) {
-      return res.status(401).json({ error: 'بيانات الدخول غير صحيحة' });
-    }
-
-    const user = users[0];
-
-    // التحقق من الحظر
-    if (user.banned) {
-      return res.status(403).json({ error: 'الحساب محظور' });
-    }
-
-    // التحقق من كلمة المرور
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'بيانات الدخول غير صحيحة' });
-    }
-
-    // تحديث آخر ظهور
-    await pool.execute(
-      'UPDATE users SET last_seen = NOW() WHERE id = ?',
-      [user.id]
-    );
-
-    // إنشاء التوكن
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-
-    // إزالة كلمة المرور من الاستجابة
-    delete user.password_hash;
-
-    res.json({
-      message: 'تم تسجيل الدخول بنجاح',
-      token,
-      user
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'خطأ في الخادم' });
-  }
-});
-
-// 4. التحقق من التوكن
-app.get('/api/verify', authenticateToken, (req, res) => {
-  res.json({ 
-    valid: true, 
-    user: req.user 
-  });
-});
-
-// 5. تحديث البروفايل
-app.put('/api/profile', authenticateToken, async (req, res) => {
-  try {
-    const { name, bio, avatar_url, name_color, animated_name, bg_color } = req.body;
-    const userId = req.user.id;
-
-    // التحقق من وجود البروفايل
-    const [profiles] = await pool.execute(
-      'SELECT id FROM profiles WHERE user_id = ?',
-      [userId]
-    );
-
-    if (profiles.length === 0) {
-      // إنشاء بروفايل جديد
-      await pool.execute(
-        `INSERT INTO profiles (id, user_id, name, bio, avatar_url, name_color, animated_name, bg_color, created_at) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [generateId(), userId, name || req.user.username, bio, avatar_url, name_color, animated_name, bg_color]
-      );
-    } else {
-      // تحديث البروفايل الموجود
-      await pool.execute(
-        `UPDATE profiles SET 
-         name = COALESCE(?, name),
-         bio = COALESCE(?, bio),
-         avatar_url = COALESCE(?, avatar_url),
-         name_color = COALESCE(?, name_color),
-         animated_name = COALESCE(?, animated_name),
-         bg_color = COALESCE(?, bg_color),
-         updated_at = NOW()
-         WHERE user_id = ?`,
-        [name, bio, avatar_url, name_color, animated_name, bg_color, userId]
-      );
-    }
-
-    // جلب البروفايل المحدث
-    const [updatedProfiles] = await pool.execute(
-      'SELECT * FROM profiles WHERE user_id = ?',
-      [userId]
-    );
-
-    res.json({
-      message: 'تم تحديث البروفايل بنجاح',
-      profile: updatedProfiles[0]
-    });
-
-  } catch (error) {
-    console.error('Profile update error:', error);
-    res.status(500).json({ error: 'خطأ في تحديث البروفايل' });
-  }
-});
-
-// 6. الحصول على البروفايل
-app.get('/api/profile/:userId?', authenticateToken, async (req, res) => {
-  try {
-    const targetUserId = req.params.userId || req.user.id;
-
-    const [profiles] = await pool.execute(
-      'SELECT * FROM profiles WHERE user_id = ?',
-      [targetUserId]
-    );
-
-    const [users] = await pool.execute(
-      'SELECT id, username, email, role, points, verified, subscription_level, avatar_url, badges, custom_badges, created_at FROM users WHERE id = ?',
-      [targetUserId]
-    );
-
-    if (profiles.length === 0 || users.length === 0) {
-      return res.status(404).json({ error: 'البروفايل غير موجود' });
-    }
-
-    // زيادة عدد المشاهدات
-    await pool.execute(
-      'UPDATE profiles SET views = views + 1 WHERE user_id = ?',
-      [targetUserId]
-    );
-
-    res.json({
-      profile: profiles[0],
-      user: users[0]
-    });
-
-  } catch (error) {
-    console.error('Get profile error:', error);
-    res.status(500).json({ error: 'خطأ في جلب البروفايل' });
-  }
-});
-
-// 7. إدارة الغرف
-app.get('/api/rooms', authenticateToken, async (req, res) => {
-  try {
-    const [rooms] = await pool.execute(
-      `SELECT r.*, u.username as owner_name, 
-       (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id) as member_count
-       FROM rooms r
-       LEFT JOIN users u ON r.owner_id = u.id
-       WHERE r.type = 'public' OR EXISTS (
-         SELECT 1 FROM room_members rm 
-         WHERE rm.room_id = r.id AND rm.user_id = ?
-       )
-       ORDER BY r.created_at DESC`,
-      [req.user.id]
-    );
-
-    res.json({ rooms });
-  } catch (error) {
-    console.error('Get rooms error:', error);
-    res.status(500).json({ error: 'خطأ في جلب الغرف' });
-  }
-});
-
-app.post('/api/rooms', authenticateToken, async (req, res) => {
-  try {
-    const { name, description, icon, type, price, max_members } = req.body;
-    
-    if (!name) {
-      return res.status(400).json({ error: 'اسم الغرفة مطلوب' });
-    }
-
-    const roomId = generateId();
-    
-    await pool.execute(
-      `INSERT INTO rooms (id, name, description, icon, owner_id, type, price, max_members, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-      [roomId, name, description, icon || '💬', req.user.id, type || 'public', price || 0, max_members || 100]
-    );
-
-    // إضافة المالك كعضو
-    await pool.execute(
-      `INSERT INTO room_members (id, room_id, user_id, role, joined_at)
-       VALUES (?, ?, ?, 'owner', NOW())`,
-      [generateId(), roomId, req.user.id]
-    );
-
-    res.status(201).json({
-      message: 'تم إنشاء الغرفة بنجاح',
-      roomId
-    });
-
-  } catch (error) {
-    console.error('Create room error:', error);
-    res.status(500).json({ error: 'خطأ في إنشاء الغرفة' });
-  }
-});
-
-// 8. إدارة الرسائل
-app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
-  try {
-    const { roomId } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
-    const offset = parseInt(req.query.offset) || 0;
-
-    // التحقق من عضوية الغرفة
-    const [memberships] = await pool.execute(
-      'SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ?',
-      [roomId, req.user.id]
-    );
-
-    if (memberships.length === 0 && req.user.role !== 'developer' && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'ليس لديك صلاحية الوصول لهذه الغرفة' });
-    }
-
-    const [messages] = await pool.execute(
-      `SELECT m.*, u.username, u.avatar_url, u.role as user_role
-       FROM messages m
-       LEFT JOIN users u ON m.user_id = u.id
-       WHERE m.room_id = ? AND m.deleted_at IS NULL
-       ORDER BY m.created_at DESC
-       LIMIT ? OFFSET ?`,
-      [roomId, limit, offset]
-    );
-
-    res.json({ messages: messages.reverse() });
-
-  } catch (error) {
-    console.error('Get messages error:', error);
-    res.status(500).json({ error: 'خطأ في جلب الرسائل' });
-  }
-});
-
-// 9. WebSocket Handling
-const connectedUsers = new Map();
-
-io.use(async (socket, next) => {
-  try {
-    const token = socket.handshake.query.token;
-    
-    if (!token) {
-      return next(new Error('التوكن مطلوب'));
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const [users] = await pool.execute(
-      'SELECT id, username, email, role, avatar_url FROM users WHERE id = ?',
-      [decoded.userId]
-    );
-
-    if (users.length === 0) {
-      return next(new Error('المستخدم غير موجود'));
-    }
-
-    socket.user = users[0];
-    socket.userId = socket.user.id;
-    next();
-  } catch (error) {
-    return next(new Error('مصادقة غير صالحة'));
-  }
-});
-
-io.on('connection', (socket) => {
-  console.log(`👤 مستخدم متصل: ${socket.user.username} (${socket.userId})`);
-  
-  // تخزين معلومات الاتصال
-  connectedUsers.set(socket.userId, {
-    socketId: socket.id,
-    user: socket.user,
-    rooms: new Set()
-  });
-
-  // إرسال تأكيد الاتصال
-  socket.emit('auth_success', {
-    user: socket.user
-  });
-
-  // 1. الانضمام للغرفة
-  socket.on('join_room', async ({ roomId }) => {
-    try {
-      // التحقق من عضوية الغرفة
-      const [membership] = await pool.execute(
-        'SELECT * FROM room_members WHERE room_id = ? AND user_id = ?',
-        [roomId, socket.userId]
-      );
-
-      if (membership.length === 0 && socket.user.role !== 'developer' && socket.user.role !== 'admin') {
-        socket.emit('error', { error: 'ليس لديك صلاحية الانضمام لهذه الغرفة' });
-        return;
-      }
-
-      // الانضمام لغرفة Socket.io
-      socket.join(roomId);
-      
-      const userInfo = connectedUsers.get(socket.userId);
-      userInfo.rooms.add(roomId);
-
-      // إعلام الآخرين بانضمام المستخدم
-      socket.to(roomId).emit('user_joined', {
-        user: socket.user,
-        roomId
-      });
-
-      // إرسال تأكيد الانضمام
-      socket.emit('join_success', {
-        roomId,
-        user: socket.user
-      });
-
-      console.log(`🚪 ${socket.user.username} انضم للغرفة ${roomId}`);
-
-    } catch (error) {
-      console.error('Join room error:', error);
-      socket.emit('error', { error: 'خطأ في الانضمام للغرفة' });
-    }
-  });
-
-  // 2. إرسال رسالة
-  socket.on('new_message', async ({ roomId, text, type = 'text', metadata = {} }) => {
-    try {
-      // التحقق من إقفال الدردشة
-      const [room] = await pool.execute(
-        'SELECT chat_locked FROM rooms WHERE id = ?',
-        [roomId]
-      );
-
-      if (room.length > 0 && room[0].chat_locked && 
-          socket.user.role !== 'owner' && 
-          socket.user.role !== 'developer' && 
-          socket.user.role !== 'admin') {
-        socket.emit('error', { error: 'الدردشة مقفلة' });
-        return;
-      }
-
-      // التحقق من الكتم
-      const [muteStatus] = await pool.execute(
-        'SELECT muted_until FROM room_members WHERE room_id = ? AND user_id = ?',
-        [roomId, socket.userId]
-      );
-
-      if (muteStatus.length > 0 && muteStatus[0].muted_until && 
-          new Date(muteStatus[0].muted_until) > new Date()) {
-        socket.emit('error', { error: 'أنت مكتوم حالياً' });
-        return;
-      }
-
-      // حفظ الرسالة
-      const messageId = generateId();
-      await pool.execute(
-        `INSERT INTO messages (id, room_id, user_id, text, type, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [messageId, roomId, socket.userId, text, type, JSON.stringify(metadata)]
-      );
-
-      // جلب الرسالة مع معلومات المستخدم
-      const [messages] = await pool.execute(
-        `SELECT m.*, u.username, u.avatar_url, u.role as user_role
-         FROM messages m
-         LEFT JOIN users u ON m.user_id = u.id
-         WHERE m.id = ?`,
-        [messageId]
-      );
-
-      const message = messages[0];
-
-      // بث الرسالة للغرفة
-      io.to(roomId).emit('new_message', {
-        ...message,
-        room: roomId
-      });
-
-      // التحقق من حد الحذف التلقائي
-      await checkAutoDelete(roomId);
-
-      console.log(`📨 ${socket.user.username} أرسل رسالة في ${roomId}`);
-
-    } catch (error) {
-      console.error('Send message error:', error);
-      socket.emit('error', { error: 'خطأ في إرسال الرسالة' });
-    }
-  });
-
-  // 3. تعديل رسالة
-  socket.on('edit_message', async ({ messageId, text }) => {
-    try {
-      // التحقق من ملكية الرسالة
-      const [messages] = await pool.execute(
-        'SELECT user_id, room_id FROM messages WHERE id = ? AND deleted_at IS NULL',
-        [messageId]
-      );
-
-      if (messages.length === 0) {
-        socket.emit('error', { error: 'الرسالة غير موجودة' });
-        return;
-      }
-
-      const message = messages[0];
-      
-      // التحقق من الصلاحيات
-      if (message.user_id !== socket.userId && 
-          socket.user.role !== 'owner' && 
-          socket.user.role !== 'developer' && 
-          socket.user.role !== 'admin') {
-        socket.emit('error', { error: 'ليس لديك صلاحية تعديل هذه الرسالة' });
-        return;
-      }
-
-      // تحديث الرسالة
-      await pool.execute(
-        'UPDATE messages SET text = ?, edited_at = NOW() WHERE id = ?',
-        [text, messageId]
-      );
-
-      // بث التعديل
-      io.to(message.room_id).emit('edit_message', {
-        messageId,
-        text,
-        editedAt: new Date().toISOString()
-      });
-
-    } catch (error) {
-      console.error('Edit message error:', error);
-      socket.emit('error', { error: 'خطأ في تعديل الرسالة' });
-    }
-  });
-
-  // 4. حذف رسالة
-  socket.on('delete_message', async ({ messageId }) => {
-    try {
-      // التحقق من ملكية الرسالة
-      const [messages] = await pool.execute(
-        'SELECT user_id, room_id FROM messages WHERE id = ? AND deleted_at IS NULL',
-        [messageId]
-      );
-
-      if (messages.length === 0) {
-        socket.emit('error', { error: 'الرسالة غير موجودة' });
-        return;
-      }
-
-      const message = messages[0];
-      
-      // التحقق من الصلاحيات
-      if (message.user_id !== socket.userId && 
-          socket.user.role !== 'owner' && 
-          socket.user.role !== 'developer' && 
-          socket.user.role !== 'admin') {
-        socket.emit('error', { error: 'ليس لديك صلاحية حذف هذه الرسالة' });
-        return;
-      }
-
-      // حذف الرسالة (soft delete)
-      await pool.execute(
-        'UPDATE messages SET deleted_at = NOW() WHERE id = ?',
-        [messageId]
-      );
-
-      // بث الحذف
-      io.to(message.room_id).emit('delete_message', {
-        messageId,
-        deletedAt: new Date().toISOString()
-      });
-
-    } catch (error) {
-      console.error('Delete message error:', error);
-      socket.emit('error', { error: 'خطأ في حذف الرسالة' });
-    }
-  });
-
-  // 5. طلب الانضمام لمقعد صوتي
-  socket.on('seat_join_request', async ({ roomId, seatNumber }) => {
-    try {
-      // التحقق من المقعد
-      const [seat] = await pool.execute(
-        'SELECT * FROM voice_seats WHERE room_id = ? AND seat_number = ?',
-        [roomId, seatNumber]
-      );
-
-      if (seat.length > 0) {
-        if (seat[0].is_locked) {
-          socket.emit('error', { error: 'المقعد مقفل' });
-          return;
+        if (!u || u.banned) {
+          wsSend(ws, { type: "auth", ok: false, error: "BANNED_OR_NOUSER" });
+          return ws.close();
         }
-        
-        if (seat[0].user_id) {
-          socket.emit('error', { error: 'المقعد مشغول' });
-          return;
-        }
+        const st = WS_STATE.get(ws);
+        st.userId = u.id;
+        st.username = u.username;
+
+        wsSend(ws, { type: "auth", ok: true, user: { id: u.id, username: u.username, is_developer: !!u.is_developer } });
+      } catch {
+        wsSend(ws, { type: "auth", ok: false, error: "BAD_TOKEN" });
+        return ws.close();
       }
-
-      // التحقق من صلاحيات المستخدم
-      const [room] = await pool.execute(
-        'SELECT owner_id FROM rooms WHERE id = ?',
-        [roomId]
-      );
-
-      if (room.length === 0) {
-        socket.emit('error', { error: 'الغرفة غير موجودة' });
-        return;
-      }
-
-      // إذا كان المقعد فارغاً، إنشاؤه
-      if (seat.length === 0) {
-        await pool.execute(
-          `INSERT INTO voice_seats (id, room_id, seat_number, user_id, joined_at)
-           VALUES (?, ?, ?, ?, NOW())`,
-          [generateId(), roomId, seatNumber, socket.userId]
-        );
-      } else {
-        // تحديث المقعد
-        await pool.execute(
-          'UPDATE voice_seats SET user_id = ?, joined_at = NOW() WHERE room_id = ? AND seat_number = ?',
-          [socket.userId, roomId, seatNumber]
-        );
-      }
-
-      // إرسال الموافقة للمستخدم
-      socket.emit('seat_join_approved', {
-        roomId,
-        seatNumber,
-        userId: socket.userId
-      });
-
-      // إرسال تحديث المقاعد للجميع
-      const [seats] = await pool.execute(
-        'SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_number',
-        [roomId]
-      );
-
-      io.to(roomId).emit('seats_update', {
-        roomId,
-        seats
-      });
-
-    } catch (error) {
-      console.error('Seat join error:', error);
-      socket.emit('error', { error: 'خطأ في الانضمام للمقعد' });
-    }
-  });
-
-  // 6. مغادرة المقعد الصوتي
-  socket.on('seat_leave', async ({ roomId, seatNumber }) => {
-    try {
-      await pool.execute(
-        'UPDATE voice_seats SET user_id = NULL, is_muted = FALSE WHERE room_id = ? AND seat_number = ? AND user_id = ?',
-        [roomId, seatNumber, socket.userId]
-      );
-
-      // إرسال تحديث المقاعد
-      const [seats] = await pool.execute(
-        'SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_number',
-        [roomId]
-      );
-
-      io.to(roomId).emit('seats_update', {
-        roomId,
-        seats
-      });
-
-    } catch (error) {
-      console.error('Seat leave error:', error);
-      socket.emit('error', { error: 'خطأ في مغادرة المقعد' });
-    }
-  });
-
-  // 7. WebRTC Signaling
-  socket.on('webrtc_offer', ({ targetUserId, offer, roomId }) => {
-    const targetUser = connectedUsers.get(targetUserId);
-    if (targetUser) {
-      io.to(targetUser.socketId).emit('webrtc_offer', {
-        fromUserId: socket.userId,
-        offer,
-        roomId
-      });
-    }
-  });
-
-  socket.on('webrtc_answer', ({ targetUserId, answer, roomId }) => {
-    const targetUser = connectedUsers.get(targetUserId);
-    if (targetUser) {
-      io.to(targetUser.socketId).emit('webrtc_answer', {
-        fromUserId: socket.userId,
-        answer,
-        roomId
-      });
-    }
-  });
-
-  socket.on('webrtc_ice_candidate', ({ targetUserId, candidate, roomId }) => {
-    const targetUser = connectedUsers.get(targetUserId);
-    if (targetUser) {
-      io.to(targetUser.socketId).emit('webrtc_ice_candidate', {
-        fromUserId: socket.userId,
-        candidate,
-        roomId
-      });
-    }
-  });
-
-  // 8. الكتابة (Typing Indicator)
-  socket.on('typing_start', ({ roomId }) => {
-    socket.to(roomId).emit('typing_start', {
-      userId: socket.userId,
-      username: socket.user.username,
-      roomId
-    });
-  });
-
-  socket.on('typing_end', ({ roomId }) => {
-    socket.to(roomId).emit('typing_end', {
-      userId: socket.userId,
-      roomId
-    });
-  });
-
-  // 9. قطع الاتصال
-  socket.on('disconnect', () => {
-    console.log(`👋 مستخدم انقطع: ${socket.user?.username || 'Unknown'} (${socket.userId})`);
-    
-    // إعلام الغرف بمغادرة المستخدم
-    const userInfo = connectedUsers.get(socket.userId);
-    if (userInfo) {
-      userInfo.rooms.forEach(roomId => {
-        socket.to(roomId).emit('user_left', {
-          userId: socket.userId,
-          username: socket.user?.username,
-          roomId
-        });
-
-        // تحديث المقاعد الصوتية
-        pool.execute(
-          'UPDATE voice_seats SET user_id = NULL WHERE user_id = ?',
-          [socket.userId]
-        ).then(() => {
-          // إرسال تحديث المقاعد
-          pool.execute(
-            'SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_number',
-            [roomId]
-          ).then(([seats]) => {
-            io.to(roomId).emit('seats_update', {
-              roomId,
-              seats
-            });
-          });
-        });
-      });
-    }
-
-    connectedUsers.delete(socket.userId);
-  });
-});
-
-// ========== وظيفة الحذف التلقائي ==========
-async function checkAutoDelete(roomId) {
-  try {
-    const [room] = await pool.execute(
-      'SELECT auto_delete_limit FROM rooms WHERE id = ?',
-      [roomId]
-    );
-
-    if (room.length === 0 || !room[0].auto_delete_limit) {
       return;
     }
 
-    const autoDeleteLimit = room[0].auto_delete_limit;
-    
-    // حساب عدد الرسائل
-    const [countResult] = await pool.execute(
-      'SELECT COUNT(*) as count FROM messages WHERE room_id = ? AND deleted_at IS NULL',
-      [roomId]
-    );
+    // All after this require auth
+    const authedUser = await requireWsAuth(ws);
+    if (!authedUser) {
+      wsSend(ws, { type: "error", error: "UNAUTHORIZED" });
+      return;
+    }
 
-    const messageCount = countResult[0].count;
+    const st = WS_STATE.get(ws);
 
-    if (messageCount > autoDeleteLimit) {
-      const messagesToDelete = messageCount - autoDeleteLimit;
-      
-      // حذف أقدم الرسائل
-      const [oldMessages] = await pool.execute(
-        `SELECT id FROM messages 
-         WHERE room_id = ? AND deleted_at IS NULL 
-         ORDER BY created_at ASC 
-         LIMIT ?`,
-        [roomId, messagesToDelete]
+    // JOIN ROOM (auto member create)
+    if (msg.type === "join_room") {
+      const roomId = mustInt(msg.room_id, 0);
+      const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
+      if (!room) return wsSend(ws, { type: "join_room", ok: false, error: "ROOM_NOT_FOUND" });
+
+      // ensure member row exists (if not, add as member)
+      const existing = await ensureMember(roomId, authedUser.id);
+      if (existing && existing.banned) return wsSend(ws, { type: "join_room", ok: false, error: "ROOM_BANNED" });
+
+      if (!existing) {
+        // if user globally developer, mark developer in room? (اختياري)
+        const role = authedUser.is_developer ? "developer" : "member";
+        await pool.execute(
+          "INSERT INTO room_members (room_id,user_id,role) VALUES (?,?,?)",
+          [roomId, authedUser.id, role]
+        );
+      } else {
+        // if globally developer but room role member, you can upgrade manually later
+      }
+
+      roomSet(roomId).add(ws);
+      st.rooms.add(roomId);
+
+      wsSend(ws, { type: "join_room", ok: true, room_id: roomId });
+
+      broadcastRoom(roomId, { type: "system", room_id: roomId, text: `انضم ${st.username}` });
+
+      await broadcastMembersSnapshot(roomId);
+      if (room.type === "voice") await broadcastSeats(roomId);
+      return;
+    }
+
+    // LEAVE ROOM
+    if (msg.type === "leave_room") {
+      const roomId = mustInt(msg.room_id, 0);
+      const set = ROOM_SOCKETS.get(roomId);
+      if (set) set.delete(ws);
+      st.rooms.delete(roomId);
+
+      wsSend(ws, { type: "leave_room", ok: true, room_id: roomId });
+      broadcastRoom(roomId, { type: "system", room_id: roomId, text: `غادر ${st.username}` });
+      await broadcastMembersSnapshot(roomId);
+      return;
+    }
+
+    // TYPING
+    if (msg.type === "typing") {
+      const roomId = mustInt(msg.room_id, 0);
+      if (!st.rooms.has(roomId)) return;
+      broadcastRoom(roomId, {
+        type: "typing",
+        room_id: roomId,
+        user_id: authedUser.id,
+        username: st.username,
+        on: !!msg.on,
+      });
+      return;
+    }
+
+    // CHAT SEND
+    if (msg.type === "chat") {
+      const roomId = mustInt(msg.room_id, 0);
+      const text = String(msg.text || "").trim();
+      if (!text) return;
+
+      if (!st.rooms.has(roomId)) return wsSend(ws, { type: "chat", ok: false, error: "NOT_IN_ROOM" });
+
+      const { room, member } = await getRoomAndMember(roomId, authedUser.id);
+      if (!room || !member) return wsSend(ws, { type: "chat", ok: false, error: "NOT_MEMBER" });
+      if (member.banned) return wsSend(ws, { type: "chat", ok: false, error: "ROOM_BANNED" });
+
+      const settings = await dbOne("SELECT chat_disabled, auto_delete_limit FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
+      if (settings?.chat_disabled && roleRank(member.role) < 2) {
+        return wsSend(ws, { type: "chat", ok: false, error: "CHAT_DISABLED" });
+      }
+
+      if (member.restricted) return wsSend(ws, { type: "chat", ok: false, error: "RESTRICTED" });
+      if (isMuted(member)) return wsSend(ws, { type: "chat", ok: false, error: "MUTED" });
+
+      const [r] = await pool.execute(
+        "INSERT INTO messages (room_id,user_id,text) VALUES (?,?,?)",
+        [roomId, authedUser.id, text]
+      );
+      const messageId = r.insertId;
+
+      // label for sender
+      const lbl = await dbOne("SELECT label_text,label_color FROM room_labels WHERE room_id=? AND user_id=? LIMIT 1", [roomId, authedUser.id]);
+
+      broadcastRoom(roomId, {
+        type: "chat",
+        ok: true,
+        room_id: roomId,
+        message: {
+          id: messageId,
+          room_id: roomId,
+          user_id: authedUser.id,
+          username: st.username,
+          text,
+          created_at: nowIso(),
+          edited_at: null,
+          deleted: 0,
+          label_text: lbl?.label_text || null,
+          label_color: lbl?.label_color || null,
+        },
+      });
+
+      await enforceAutoDelete(roomId);
+      return;
+    }
+
+    // EDIT MESSAGE (owner/dev OR message owner)
+    if (msg.type === "edit_message") {
+      const roomId = mustInt(msg.room_id, 0);
+      const messageId = Number(msg.message_id);
+      const newText = String(msg.text || "").trim();
+      if (!roomId || !messageId || !newText) return;
+
+      const m = await dbOne("SELECT * FROM messages WHERE id=? AND room_id=? LIMIT 1", [messageId, roomId]);
+      if (!m || m.deleted) return wsSend(ws, { type: "edit_message", ok: false, error: "NOT_FOUND" });
+
+      const member = await ensureMember(roomId, authedUser.id);
+      if (!member) return wsSend(ws, { type: "edit_message", ok: false, error: "NOT_MEMBER" });
+
+      const can = (m.user_id === authedUser.id) || roleRank(member.role) >= 2;
+      if (!can) return wsSend(ws, { type: "edit_message", ok: false, error: "NO_PERMISSION" });
+
+      await pool.execute(
+        "UPDATE messages SET text=?, edited_at=NOW() WHERE id=?",
+        [newText, messageId]
       );
 
-      for (const msg of oldMessages) {
+      broadcastRoom(roomId, {
+        type: "message_updated",
+        room_id: roomId,
+        message_id: messageId,
+        text: newText,
+        edited_at: nowIso(),
+      });
+      wsSend(ws, { type: "edit_message", ok: true });
+      return;
+    }
+
+    // DELETE MESSAGE (owner/dev OR message owner)
+    if (msg.type === "delete_message") {
+      const roomId = mustInt(msg.room_id, 0);
+      const messageId = Number(msg.message_id);
+      if (!roomId || !messageId) return;
+
+      const m = await dbOne("SELECT * FROM messages WHERE id=? AND room_id=? LIMIT 1", [messageId, roomId]);
+      if (!m || m.deleted) return wsSend(ws, { type: "delete_message", ok: false, error: "NOT_FOUND" });
+
+      const member = await ensureMember(roomId, authedUser.id);
+      if (!member) return wsSend(ws, { type: "delete_message", ok: false, error: "NOT_MEMBER" });
+
+      const can = (m.user_id === authedUser.id) || roleRank(member.role) >= 2;
+      if (!can) return wsSend(ws, { type: "delete_message", ok: false, error: "NO_PERMISSION" });
+
+      await pool.execute("UPDATE messages SET deleted=1 WHERE id=?", [messageId]);
+
+      broadcastRoom(roomId, { type: "message_deleted", room_id: roomId, message_id: messageId });
+      wsSend(ws, { type: "delete_message", ok: true });
+      return;
+    }
+
+    // MODERATION: mute/ban/restrict/kick + chat on/off + set auto delete
+    if (msg.type === "moderate") {
+      const roomId = mustInt(msg.room_id, 0);
+      const action = String(msg.action || "");
+      const targetUserId = mustInt(msg.target_user_id, 0);
+      const minutes = mustInt(msg.minutes, 0);
+
+      if (!roomId || !action) return;
+
+      const canMod = await ensureCanModerate(roomId, authedUser.id);
+      if (!canMod) return wsSend(ws, { type: "moderate", ok: false, error: "NO_PERMISSION" });
+
+      if (["mute", "ban", "unban", "restrict", "unrestrict", "kick"].includes(action) && !targetUserId) {
+        return wsSend(ws, { type: "moderate", ok: false, error: "NO_TARGET" });
+      }
+
+      if (action === "mute") {
+        const until = new Date(Date.now() + Math.max(1, minutes) * 60_000);
         await pool.execute(
-          'UPDATE messages SET deleted_at = NOW() WHERE id = ?',
-          [msg.id]
+          "UPDATE room_members SET muted_until=? WHERE room_id=? AND user_id=?",
+          [until.toISOString().slice(0, 19).replace("T", " "), roomId, targetUserId]
+        );
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم كتم المستخدم (${targetUserId})` });
+      }
+
+      if (action === "ban") {
+        await pool.execute(
+          "UPDATE room_members SET banned=1 WHERE room_id=? AND user_id=?",
+          [roomId, targetUserId]
+        );
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم حظر المستخدم (${targetUserId})` });
+      }
+
+      if (action === "unban") {
+        await pool.execute(
+          "UPDATE room_members SET banned=0 WHERE room_id=? AND user_id=?",
+          [roomId, targetUserId]
+        );
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم رفع الحظر عن المستخدم (${targetUserId})` });
+      }
+
+      if (action === "restrict") {
+        await pool.execute(
+          "UPDATE room_members SET restricted=1 WHERE room_id=? AND user_id=?",
+          [roomId, targetUserId]
+        );
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم تقييد الدردشة للمستخدم (${targetUserId})` });
+      }
+
+      if (action === "unrestrict") {
+        await pool.execute(
+          "UPDATE room_members SET restricted=0 WHERE room_id=? AND user_id=?",
+          [roomId, targetUserId]
+        );
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم فك التقييد عن المستخدم (${targetUserId})` });
+      }
+
+      if (action === "kick") {
+        // remove from WS room if online
+        const set = ROOM_SOCKETS.get(roomId);
+        if (set) {
+          for (const sock of set) {
+            const sst = WS_STATE.get(sock);
+            if (sst?.userId === targetUserId) {
+              sst.rooms.delete(roomId);
+              set.delete(sock);
+              wsSend(sock, { type: "kicked", room_id: roomId });
+            }
+          }
+        }
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم طرد المستخدم (${targetUserId})` });
+      }
+
+      await broadcastMembersSnapshot(roomId);
+      wsSend(ws, { type: "moderate", ok: true });
+      return;
+    }
+
+    // SET LABEL (dev/owner)
+    if (msg.type === "set_label") {
+      const roomId = mustInt(msg.room_id, 0);
+      const targetUserId = mustInt(msg.target_user_id, 0);
+      const labelText = String(msg.label_text || "").trim();
+      const labelColor = String(msg.label_color || "#ff3b30").trim();
+
+      if (!roomId || !targetUserId || !labelText) return;
+
+      const canMod = await ensureCanModerate(roomId, authedUser.id);
+      if (!canMod) return wsSend(ws, { type: "set_label", ok: false, error: "NO_PERMISSION" });
+
+      await setRoomLabel(roomId, targetUserId, labelText.slice(0, 40), labelColor.slice(0, 20));
+      await broadcastMembersSnapshot(roomId);
+
+      wsSend(ws, { type: "set_label", ok: true });
+      return;
+    }
+
+    // TRANSFER OWNERSHIP (owner only)
+    if (msg.type === "transfer_owner") {
+      const roomId = mustInt(msg.room_id, 0);
+      const newOwnerId = mustInt(msg.new_owner_id, 0);
+      if (!roomId || !newOwnerId) return;
+
+      const canOwner = await ensureCanOwner(roomId, authedUser.id);
+      if (!canOwner) return wsSend(ws, { type: "transfer_owner", ok: false, error: "ONLY_OWNER" });
+
+      const target = await ensureMember(roomId, newOwnerId);
+      if (!target || target.banned) return wsSend(ws, { type: "transfer_owner", ok: false, error: "TARGET_NOT_MEMBER" });
+
+      await pool.execute(
+        "UPDATE room_members SET role='member' WHERE room_id=? AND user_id=?",
+        [roomId, authedUser.id]
+      );
+      await pool.execute(
+        "UPDATE room_members SET role='owner' WHERE room_id=? AND user_id=?",
+        [roomId, newOwnerId]
+      );
+      await pool.execute(
+        "UPDATE rooms SET owner_user_id=? WHERE id=?",
+        [newOwnerId, roomId]
+      );
+
+      broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم نقل الملكية الى المستخدم (${newOwnerId})` });
+      await broadcastMembersSnapshot(roomId);
+      wsSend(ws, { type: "transfer_owner", ok: true });
+      return;
+    }
+
+    // POINTS GIVE (dev/owner can grant in room OR any user can send if enough)
+    if (msg.type === "give_points") {
+      const to = mustInt(msg.to_user_id, 0);
+      const amount = mustInt(msg.amount, 0);
+      const reason = String(msg.reason || "").slice(0, 150);
+
+      if (!to || amount <= 0) return wsSend(ws, { type: "give_points", ok: false, error: "BAD_INPUT" });
+
+      // If msg.room_id exists -> optionally require membership
+      const roomId = mustInt(msg.room_id, 0);
+      if (roomId) {
+        const meMem = await ensureMember(roomId, authedUser.id);
+        if (!meMem) return wsSend(ws, { type: "give_points", ok: false, error: "NOT_MEMBER" });
+      }
+
+      const r = await updatePoints(authedUser.id, to, amount, reason || "transfer");
+      if (!r.ok) return wsSend(ws, { type: "give_points", ok: false, error: r.error });
+
+      wsSend(ws, { type: "give_points", ok: true });
+      return;
+    }
+
+    /**
+     * ===== WebRTC Signaling (Voice Rooms) =====
+     * Client sends:
+     * - seat_take {room_id, seat_index}
+     * - seat_leave {room_id, seat_index}
+     * - webrtc_offer/answer/ice {room_id, to_user_id, payload}
+     */
+    if (msg.type === "seat_take") {
+      const roomId = mustInt(msg.room_id, 0);
+      const seatIndex = mustInt(msg.seat_index, 0);
+      if (!roomId || seatIndex < 1 || seatIndex > 50) return;
+
+      const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
+      if (!room || room.type !== "voice") return wsSend(ws, { type: "seat_take", ok: false, error: "NOT_VOICE_ROOM" });
+
+      if (!st.rooms.has(roomId)) return wsSend(ws, { type: "seat_take", ok: false, error: "NOT_IN_ROOM" });
+
+      // seat must be empty
+      const seat = await dbOne(
+        "SELECT user_id FROM room_seats WHERE room_id=? AND seat_index=? LIMIT 1",
+        [roomId, seatIndex]
+      );
+
+      if (!seat) {
+        await pool.execute(
+          "INSERT INTO room_seats (room_id, seat_index, user_id) VALUES (?,?,?)",
+          [roomId, seatIndex, authedUser.id]
+        );
+      } else {
+        if (seat.user_id) return wsSend(ws, { type: "seat_take", ok: false, error: "SEAT_TAKEN" });
+        await pool.execute(
+          "UPDATE room_seats SET user_id=? WHERE room_id=? AND seat_index=?",
+          [authedUser.id, roomId, seatIndex]
         );
       }
 
-      // إرسال إشعار الحذف
-      io.to(roomId).emit('auto_delete_notification', {
-        deletedCount: messagesToDelete,
-        message: 'تم حذف الرسائل لتوفير مساحة للدردشة'
-      });
-
-      console.log(`🗑️ حُذفت ${messagesToDelete} رسالة تلقائياً من الغرفة ${roomId}`);
+      await broadcastSeats(roomId);
+      wsSend(ws, { type: "seat_take", ok: true });
+      return;
     }
 
-  } catch (error) {
-    console.error('Auto delete error:', error);
-  }
-}
+    if (msg.type === "seat_leave") {
+      const roomId = mustInt(msg.room_id, 0);
+      const seatIndex = mustInt(msg.seat_index, 0);
+      if (!roomId || seatIndex < 1) return;
 
-// ========== بدء السيرفر ==========
-async function startServer() {
-  try {
-    // تهيئة قاعدة البيانات
-    await initializeDatabase();
-    
-    // تشغيل السيرفر
-    server.listen(PORT, () => {
-      console.log(`🚀 السيرفر يعمل على المنفذ ${PORT}`);
-      console.log(`🔗 رابط السيرفر: http://localhost:${PORT}`);
-      console.log(`📊 قاعدة البيانات: ${DB_CONFIG.host}:${DB_CONFIG.port}/${DB_CONFIG.database}`);
-      console.log(`🔐 JWT Secret: ${JWT_SECRET ? 'مضبوط' : 'غير مضبوط - تستخدم القيمة الافتراضية'}`);
-    });
+      const seat = await dbOne(
+        "SELECT user_id FROM room_seats WHERE room_id=? AND seat_index=? LIMIT 1",
+        [roomId, seatIndex]
+      );
 
-    // معالجة إغلاق التطبيق
-    process.on('SIGTERM', async () => {
-      console.log('🛑 إغلاق السيرفر...');
-      if (pool) {
-        await pool.end();
+      if (!seat || seat.user_id !== authedUser.id) return wsSend(ws, { type: "seat_leave", ok: false, error: "NOT_YOUR_SEAT" });
+
+      await pool.execute(
+        "UPDATE room_seats SET user_id=NULL WHERE room_id=? AND seat_index=?",
+        [roomId, seatIndex]
+      );
+      await broadcastSeats(roomId);
+      wsSend(ws, { type: "seat_leave", ok: true });
+      return;
+    }
+
+    if (msg.type === "webrtc_offer" || msg.type === "webrtc_answer" || msg.type === "webrtc_ice") {
+      const roomId = mustInt(msg.room_id, 0);
+      const toUserId = mustInt(msg.to_user_id, 0);
+      const payload = msg.payload;
+
+      if (!roomId || !toUserId || !payload) return;
+      if (!st.rooms.has(roomId)) return;
+
+      // send to target user socket(s) inside room
+      const set = ROOM_SOCKETS.get(roomId);
+      if (!set) return;
+
+      for (const sock of set) {
+        const sst = WS_STATE.get(sock);
+        if (sst?.userId === toUserId) {
+          wsSend(sock, {
+            type: msg.type,
+            room_id: roomId,
+            from_user_id: authedUser.id,
+            payload,
+          });
+        }
       }
-      server.close(() => {
-        console.log('✅ تم إغلاق السيرفر بنجاح');
-        process.exit(0);
-      });
-    });
+      return;
+    }
 
-  } catch (error) {
-    console.error('❌ فشل بدء السيرفر:', error);
+    // unknown
+    wsSend(ws, { type: "error", error: "UNKNOWN_TYPE" });
+  });
+
+  ws.on("close", async () => {
+    const st = WS_STATE.get(ws);
+    WS_STATE.delete(ws);
+
+    if (st?.rooms?.size) {
+      for (const roomId of st.rooms) {
+        const set = ROOM_SOCKETS.get(roomId);
+        if (set) set.delete(ws);
+
+        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `غادر ${st.username || "مستخدم"}` });
+        await broadcastMembersSnapshot(roomId);
+      }
+    }
+  });
+});
+
+/* ================== START ================== */
+async function start() {
+  try {
+    await initializeDatabase();
+    server.listen(PORT, () => {
+      console.log(`🚀 Server running on :${PORT}`);
+      console.log(`📦 DB: ${DB_CONFIG.host}:${DB_CONFIG.port}/${DB_CONFIG.database}`);
+      console.log(`🔐 JWT: READY`);
+    });
+  } catch (e) {
+    console.error("❌ Start failed:", e);
     process.exit(1);
   }
 }
 
-// تشغيل السيرفر
-startServer();
+start();
