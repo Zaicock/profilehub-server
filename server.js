@@ -7,6 +7,7 @@ const jwt = require("jsonwebtoken");
 // ================== إعدادات ==================
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const PORT = process.env.PORT || 3000;
+const MAX_SEATS = 6;
 
 // ================== App ==================
 const app = express();
@@ -27,7 +28,6 @@ app.post("/api/register", (req, res) => {
     return res.status(400).json({ error: "بيانات ناقصة" });
   }
 
-  // تحقق من الاسم
   for (const u of registeredUsers.values()) {
     if (u.username === username) {
       return res.status(409).json({ error: "اسم المستخدم مستخدم بالفعل" });
@@ -59,7 +59,6 @@ app.post("/api/login", (req, res) => {
     return res.status(400).json({ error: "بيانات ناقصة" });
   }
 
-  // مؤقت (لاحقاً DB)
   let user = Array.from(registeredUsers.values()).find(u => u.email === email);
 
   if (!user) {
@@ -94,64 +93,23 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// ================== تحديث البروفايل ==================
-app.post("/api/profile/update", authMiddleware, (req, res) => {
-  const { username, avatar } = req.body;
-  const userId = req.user.id;
-
-  const currentUser = registeredUsers.get(userId);
-  if (!currentUser) {
-    return res.status(404).json({ error: "المستخدم غير موجود" });
-  }
-
-  // تحقق من الاسم
-  if (username) {
-    for (const u of registeredUsers.values()) {
-      if (u.username === username && u.id !== userId) {
-        return res.status(409).json({
-          error: "اسم المستخدم مستخدم بالفعل"
-        });
-      }
-    }
-  }
-
-  if (username) currentUser.username = username;
-  if (avatar) currentUser.avatar = avatar;
-
-  registeredUsers.set(userId, currentUser);
-
-  // بث التحديث
-  rooms.forEach((_, roomId) => {
-    broadcast(roomId, {
-      type: "profile-updated",
-      user: {
-        id: currentUser.id,
-        username: currentUser.username,
-        avatar: currentUser.avatar
-      },
-      timestamp: new Date().toISOString()
-    });
-  });
-
-  res.json({
-    success: true,
-    user: currentUser
-  });
-});
-
 // ================== HTTP Server ==================
 const server = http.createServer(app);
 
 // ================== WebSocket ==================
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
-// ===== تخزين =====
-const rooms = new Map(); // roomId => Set<ws>
+// ================== التخزين ==================
+const rooms = new Map(); // roomId => { clients:Set, seats:Array, seatMap:Map }
 const users = new Map(); // ws => user
 
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Set());
+    rooms.set(roomId, {
+      clients: new Set(),
+      seats: Array(MAX_SEATS).fill(null),
+      seatMap: new Map() // ws => seatIndex
+    });
   }
   return rooms.get(roomId);
 }
@@ -161,7 +119,7 @@ function broadcast(roomId, data) {
   if (!room) return;
 
   const payload = JSON.stringify(data);
-  room.forEach(client => {
+  room.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
     }
@@ -174,24 +132,40 @@ wss.on("connection", (ws, req) => {
   const roomId = url.searchParams.get("room") || "global";
   const token = url.searchParams.get("token");
 
-  if (!token) {
-    ws.close();
-    return;
-  }
+  if (!token) return ws.close();
 
   let user;
   try {
     user = jwt.verify(token, JWT_SECRET);
   } catch {
-    ws.close();
-    return;
+    return ws.close();
   }
 
   const room = getRoom(roomId);
-  room.add(ws);
+  room.clients.add(ws);
   users.set(ws, user);
 
-  console.log(`📡 CONNECT | ${user.username} | room=${roomId}`);
+  // ===== حجز مقعد =====
+  const seatIndex = room.seats.findIndex(s => s === null);
+  if (seatIndex !== -1) {
+    room.seats[seatIndex] = user.id;
+    room.seatMap.set(ws, seatIndex);
+
+    ws.send(
+      JSON.stringify({
+        type: "seat-assigned",
+        seat: seatIndex,
+        seats: room.seats
+      })
+    );
+  } else {
+    ws.send(JSON.stringify({ type: "room-full" }));
+  }
+
+  broadcast(roomId, {
+    type: "seats-update",
+    seats: room.seats
+  });
 
   ws.send(
     JSON.stringify({
@@ -218,14 +192,13 @@ wss.on("connection", (ws, req) => {
 
     if (!data.text) return;
 
-    // تحديث البيانات من التخزين
     const updatedUser = registeredUsers.get(user.id);
     if (updatedUser) {
       user.username = updatedUser.username;
       user.avatar = updatedUser.avatar;
     }
 
-    const message = {
+    broadcast(roomId, {
       type: "new-message",
       user: {
         id: user.id,
@@ -235,26 +208,31 @@ wss.on("connection", (ws, req) => {
       text: data.text,
       room: roomId,
       timestamp: new Date().toISOString()
-    };
-
-    console.log(`💬 ${user.username}: ${data.text}`);
-    broadcast(roomId, message);
+    });
   });
 
   ws.on("close", () => {
-    room.delete(ws);
+    room.clients.delete(ws);
     users.delete(ws);
 
-    console.log(`👋 LEAVE | ${user.username}`);
+    const seat = room.seatMap.get(ws);
+    if (seat !== undefined) {
+      room.seats[seat] = null;
+      room.seatMap.delete(ws);
+    }
+
+    broadcast(roomId, {
+      type: "seats-update",
+      seats: room.seats
+    });
 
     broadcast(roomId, {
       type: "user-left",
       userId: user.id,
-      room: roomId,
       timestamp: new Date().toISOString()
     });
 
-    if (room.size === 0) {
+    if (room.clients.size === 0) {
       rooms.delete(roomId);
     }
   });
@@ -267,23 +245,17 @@ wss.on("connection", (ws, req) => {
 // ================== Status ==================
 app.get("/", (req, res) => {
   const stats = {};
-  rooms.forEach((set, roomId) => {
-    stats[roomId] = set.size;
+  rooms.forEach((room, roomId) => {
+    stats[roomId] = {
+      users: room.clients.size,
+      seats: room.seats
+    };
   });
 
   res.json({
     status: "running",
     rooms: stats,
     totalRooms: rooms.size,
-    totalUsers: Array.from(rooms.values()).reduce((a, b) => a + b.size, 0),
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get("/status", (req, res) => {
-  res.json({
-    status: "online",
-    uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
 });
