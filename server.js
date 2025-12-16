@@ -65,10 +65,21 @@ function getDbConfigFromEnv() {
 }
 
 const baseDb = getDbConfigFromEnv();
+
+// DEBUG مؤقت (احذفه بعد التأكد)
+console.log("🔍 DB ENV CHECK", {
+  MYSQLHOST: process.env.MYSQLHOST,
+  MYSQLUSER: process.env.MYSQLUSER,
+  MYSQLDATABASE: process.env.MYSQLDATABASE,
+  MYSQL_URL: process.env.MYSQL_URL,
+  MYSQL_PUBLIC_URL: process.env.MYSQL_PUBLIC_URL
+});
+
 if (!baseDb) {
-  console.error("❌ DB config not found. Set MYSQLHOST.. or DATABASE_URL");
+  console.error("❌ DB config not found. Variables موجودة بس مو مقروءة من السيرفر");
   process.exit(1);
 }
+
 
 const DB_CONFIG = {
   ...baseDb,
