@@ -466,11 +466,11 @@ app.post(["/api/register", "/auth/register"], async (req, res) => {
 app.post(["/api/login", "/auth/login"], async (req, res) => {
   const { email, password } = req.body;
 
-  if (!login || !password) {
+  if (!email || !password) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
   }
 
-  const isEmail = login.includes("@");
+  const isEmail = email.includes("@");
 
   const user = await dbOne(
     isEmail
