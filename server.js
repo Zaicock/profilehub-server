@@ -464,7 +464,7 @@ app.post(["/api/register", "/auth/register"], async (req, res) => {
 });
 
 app.post(["/api/login", "/auth/login"], async (req, res) => {
-  const { login, password } = req.body;
+  const { email, password } = req.body;
 
   if (!login || !password) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
