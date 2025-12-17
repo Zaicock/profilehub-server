@@ -1,14 +1,7 @@
 /**
- * SINGLE-FILE SERVER (Drop-in)
- * Express + ws + mysql2 + jwt
- *
- * Keeps compatibility with your existing API:
- * - /api/register, /api/login, /api/me, /api/rooms, /api/rooms/:id, /api/rooms/:id/messages, ...
- * Adds REST routes requested:
- * - /auth/register, /auth/login, /profile, /messages/:id, /points/grant, /rooms/:id/mute, /frames, /subscriptions, /bots...
- *
- * WebSocket protocol (type-based):
- * - auth -> join_room -> chat/edit/delete/moderate/seats/webrtc...
+ * COMPLETE SERVER FILE - ProfileHub v2.0
+ * Express + WebSocket + MySQL + JWT + Full API
+ * Supports: Chat, Voice Rooms, Frames, Points, Moderation, Bots, Subscriptions
  */
 
 require("dotenv").config();
@@ -19,1578 +12,3332 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
+const bcrypt = require("bcrypt");
+const path = require("path");
 
 const app = express();
 app.use(cors({
   origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
-app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-/* ================== DB AUTO DETECT ================== */
-function parseDbUrl(url) {
-  const u = new URL(url);
-  return {
-    host: u.hostname,
-    port: u.port ? Number(u.port) : 3306,
-    user: decodeURIComponent(u.username),
-    password: decodeURIComponent(u.password),
-    database: u.pathname.replace("/", ""),
-  };
-}
-function getDbConfigFromEnv() {
-  if (process.env.MYSQLHOST && process.env.MYSQLUSER && process.env.MYSQLPASSWORD && process.env.MYSQLDATABASE) {
-    return {
-      host: process.env.MYSQLHOST,
-      port: process.env.MYSQLPORT ? Number(process.env.MYSQLPORT) : 3306,
-      user: process.env.MYSQLUSER,
-      password: process.env.MYSQLPASSWORD,
-      database: process.env.MYSQLDATABASE,
-    };
-  }
-  const url = process.env.DATABASE_URL || process.env.MYSQL_URL;
-  if (url) return parseDbUrl(url);
-  return null;
-}
-
-const baseDb = getDbConfigFromEnv();
-console.log("🔍 DB ENV CHECK", {
-  MYSQLHOST: process.env.MYSQLHOST,
-  MYSQLUSER: process.env.MYSQLUSER,
-  MYSQLDATABASE: process.env.MYSQLDATABASE,
-  MYSQL_URL: process.env.MYSQL_URL,
-  MYSQL_PUBLIC_URL: process.env.MYSQL_PUBLIC_URL,
-});
-if (!baseDb) {
-  console.error("❌ DB config not found.");
-  process.exit(1);
-}
-
+// ================== DATABASE CONFIGURATION ==================
 const DB_CONFIG = {
-  ...baseDb,
+  host: process.env.MYSQLHOST || "localhost",
+  port: process.env.MYSQLPORT || 3306,
+  user: process.env.MYSQLUSER || "root",
+  password: process.env.MYSQLPASSWORD || "",
+  database: process.env.MYSQLDATABASE || "profilehub",
   waitForConnections: true,
-  connectionLimit: 15,
+  connectionLimit: 20,
   queueLimit: 0,
   ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : false,
 };
 
 let pool;
+let JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString("hex");
 
-/* ================== JWT SECRET (ENV OR DB) ================== */
-let JWT_SECRET = process.env.JWT_SECRET || null;
-
-async function dbOne(sql, params) {
-  const [rows] = await pool.execute(sql, params);
-  return rows && rows.length ? rows[0] : null;
+// ================== UTILITY FUNCTIONS ==================
+async function dbOne(sql, params = []) {
+  try {
+    const [rows] = await pool.execute(sql, params);
+    return rows && rows.length ? rows[0] : null;
+  } catch (error) {
+    console.error("Database query error:", error);
+    throw error;
+  }
 }
+
+async function dbAll(sql, params = []) {
+  try {
+    const [rows] = await pool.execute(sql, params);
+    return rows;
+  } catch (error) {
+    console.error("Database query error:", error);
+    throw error;
+  }
+}
+
 function nowIso() {
   return new Date().toISOString().slice(0, 19).replace("T", " ");
 }
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
 }
+
 function mustInt(n, def = 0) {
   const x = Number(n);
   return Number.isFinite(x) ? Math.trunc(x) : def;
 }
 
-/* ================== PASSWORD HASH (pbkdf2, supports legacy sha256) ================== */
-function sha256Hex(s) {
-  return crypto.createHash("sha256").update(String(s)).digest("hex");
-}
-function pbkdf2Hash(password, iters = 140000) {
-  const salt = crypto.randomBytes(16);
-  const dk = crypto.pbkdf2Sync(String(password), salt, iters, 32, "sha256");
-  return `pbkdf2$${iters}$${salt.toString("base64")}$${dk.toString("base64")}`;
-}
-function pbkdf2Verify(password, stored) {
-  // "pbkdf2$iters$saltB64$hashB64"
-  const parts = String(stored || "").split("$");
-  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
-  const iters = Number(parts[1]);
-  const salt = Buffer.from(parts[2], "base64");
-  const hash = Buffer.from(parts[3], "base64");
-  const dk = crypto.pbkdf2Sync(String(password), salt, iters, hash.length, "sha256");
-  return crypto.timingSafeEqual(dk, hash);
-}
-function verifyPassword(password, stored) {
-  const v = String(stored || "");
-  // legacy sha256 hex
-  if (/^[a-f0-9]{64}$/i.test(v)) return sha256Hex(password) === v;
-  // pbkdf2 format
-  if (v.startsWith("pbkdf2$")) return pbkdf2Verify(password, v);
-  return false;
+// ================== PASSWORD HASHING ==================
+const SALT_ROUNDS = 12;
+
+async function hashPassword(password) {
+  return await bcrypt.hash(password, SALT_ROUNDS);
 }
 
-/* ================== DB bootstrap ================== */
-async function ensureJwtSecret() {
-  if (JWT_SECRET) return JWT_SECRET;
+async function verifyPassword(password, hash) {
+  return await bcrypt.compare(password, hash);
+}
 
-  const row = await dbOne("SELECT setting_value FROM server_settings WHERE setting_key=? LIMIT 1", ["jwt_secret"]);
-  if (row?.setting_value) {
-    JWT_SECRET = row.setting_value;
-    return JWT_SECRET;
-  }
-  JWT_SECRET = crypto.randomBytes(48).toString("hex");
-  await pool.execute(
-    "INSERT INTO server_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)",
-    ["jwt_secret", JWT_SECRET]
+// ================== JWT FUNCTIONS ==================
+function generateToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      is_developer: user.is_developer || false,
+      verified: user.verified || false,
+    },
+    JWT_SECRET,
+    { expiresIn: "30d" }
   );
-  console.log("🔐 JWT_SECRET generated & stored in DB");
-  return JWT_SECRET;
 }
 
-async function tryExec(sql) {
-  try { await pool.execute(sql); } catch (e) { /* ignore duplicate/exists */ }
+function verifyToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
 }
 
-async function createTablesIfNotExist() {
-  // base tables (compatible with your current server) + v2 additions
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS server_settings (
-      setting_key VARCHAR(100) PRIMARY KEY,
-      setting_value TEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )
-  `);
+// ================== AUTH MIDDLEWARE ==================
+async function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "NO_TOKEN" });
+  }
+  
+  const token = authHeader.split(" ")[1];
+  const decoded = verifyToken(token);
+  
+  if (!decoded) {
+    return res.status(401).json({ error: "INVALID_TOKEN" });
+  }
+  
+  // Check if user exists and is not banned
+  const user = await dbOne(
+    "SELECT id, username, email, is_developer, verified, points, banned, avatar_url, bio, frame_id, created_at FROM users WHERE id = ?",
+    [decoded.id]
+  );
+  
+  if (!user || user.banned) {
+    return res.status(401).json({ error: "USER_NOT_FOUND_OR_BANNED" });
+  }
+  
+  req.user = user;
+  next();
+}
 
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS users (
+// ================== PERMISSIONS ==================
+function roleRank(role) {
+  const ranks = {
+    owner: 3,
+    developer: 3, // Developer has same rank as owner
+    admin: 2,
+    member: 1,
+  };
+  return ranks[role] || 1;
+}
+
+async function getRoomMember(roomId, userId) {
+  return await dbOne(
+    "SELECT * FROM room_members WHERE room_id = ? AND user_id = ?",
+    [roomId, userId]
+  );
+}
+
+async function canModerateRoom(roomId, userId) {
+  const member = await getRoomMember(roomId, userId);
+  if (!member) return false;
+  
+  const user = await dbOne("SELECT is_developer FROM users WHERE id = ?", [userId]);
+  if (user?.is_developer) return true;
+  
+  return roleRank(member.role) >= 2;
+}
+
+async function isRoomOwner(roomId, userId) {
+  const member = await getRoomMember(roomId, userId);
+  if (!member) return false;
+  return member.role === "owner";
+}
+
+// ================== DATABASE INITIALIZATION ==================
+async function initializeDatabase() {
+  try {
+    pool = await mysql.createPool(DB_CONFIG);
+    console.log("✅ Database connected successfully");
+    
+    // Create tables if they don't exist
+    await createTables();
+    
+    // Create default admin user if not exists
+    await createDefaultAdmin();
+    
+    return true;
+  } catch (error) {
+    console.error("❌ Database initialization failed:", error);
+    return false;
+  }
+}
+
+async function createTables() {
+  const tables = [
+    // Users table
+    `CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
       username VARCHAR(50) UNIQUE NOT NULL,
       email VARCHAR(100) UNIQUE NOT NULL,
-      pass_hash VARCHAR(255) NOT NULL,
-      is_developer TINYINT DEFAULT 0,
-      points INT DEFAULT 0,
-      banned TINYINT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS rooms (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(80) NOT NULL,
-      type ENUM('text','voice') DEFAULT 'text',
-      owner_user_id INT NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      is_developer BOOLEAN DEFAULT FALSE,
+      points INT DEFAULT 100,
+      verified BOOLEAN DEFAULT FALSE,
+      banned BOOLEAN DEFAULT FALSE,
+      avatar_url TEXT,
+      bio TEXT,
+      links_json JSON,
+      frame_id INT,
+      referral_code VARCHAR(20) UNIQUE,
+      referred_by INT,
+      settings_json JSON DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS room_members (
+      last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_username (username),
+      INDEX idx_email (email),
+      INDEX idx_points (points),
+      INDEX idx_banned (banned)
+    )`,
+    
+    // Frames table
+    `CREATE TABLE IF NOT EXISTS frames (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      css_class VARCHAR(100),
+      image_url TEXT,
+      price_points INT DEFAULT 0,
+      category VARCHAR(50) DEFAULT 'basic',
+      available BOOLEAN DEFAULT TRUE,
+      created_by INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_category (category),
+      INDEX idx_available (available)
+    )`,
+    
+    // User frames (purchased frames)
+    `CREATE TABLE IF NOT EXISTS user_frames (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      frame_id INT NOT NULL,
+      purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
+      UNIQUE KEY unique_user_frame (user_id, frame_id),
+      INDEX idx_user_id (user_id)
+    )`,
+    
+    // Rooms table
+    `CREATE TABLE IF NOT EXISTS rooms (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      type ENUM('text', 'voice') DEFAULT 'text',
+      icon VARCHAR(10) DEFAULT '💬',
+      owner_id INT NOT NULL,
+      price_points INT DEFAULT 0,
+      max_members INT DEFAULT 100,
+      voice_seats INT DEFAULT 8,
+      settings_json JSON DEFAULT '{}',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      INDEX idx_type (type),
+      INDEX idx_owner_id (owner_id)
+    )`,
+    
+    // Room members table
+    `CREATE TABLE IF NOT EXISTS room_members (
       id INT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
       user_id INT NOT NULL,
-      role ENUM('owner','developer','member') DEFAULT 'member',
-      muted_until DATETIME NULL,
-      restricted TINYINT DEFAULT 0,
-      banned TINYINT DEFAULT 0,
+      role ENUM('owner', 'admin', 'member') DEFAULT 'member',
       joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_room_user (room_id, user_id),
+      muted_until TIMESTAMP NULL,
+      is_banned BOOLEAN DEFAULT FALSE,
+      label_text VARCHAR(50),
+      label_color VARCHAR(20) DEFAULT '#007AFF',
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS room_settings (
-      room_id INT PRIMARY KEY,
-      auto_delete_limit INT DEFAULT 0,
-      chat_disabled TINYINT DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS messages (
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE KEY unique_room_user (room_id, user_id),
+      INDEX idx_room_id (room_id),
+      INDEX idx_user_id (user_id),
+      INDEX idx_role (role)
+    )`,
+    
+    // Messages table
+    `CREATE TABLE IF NOT EXISTS messages (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
       user_id INT NOT NULL,
       text TEXT NOT NULL,
+      message_type ENUM('text', 'image', 'system', 'bot') DEFAULT 'text',
+      metadata_json JSON,
+      edited BOOLEAN DEFAULT FALSE,
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_by INT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      edited_at DATETIME NULL,
-      deleted TINYINT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      INDEX idx_room_time (room_id, created_at)
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS point_transactions (
+      INDEX idx_room_id (room_id),
+      INDEX idx_user_id (user_id),
+      INDEX idx_created_at (created_at),
+      INDEX idx_deleted (deleted)
+    )`,
+    
+    // Points transactions table
+    `CREATE TABLE IF NOT EXISTS point_transactions (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      from_user_id INT NULL,
-      to_user_id INT NULL,
+      from_user_id INT,
+      to_user_id INT NOT NULL,
       amount INT NOT NULL,
-      reason VARCHAR(150) NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS room_labels (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      room_id INT NOT NULL,
-      user_id INT NOT NULL,
-      label_text VARCHAR(40) NOT NULL,
-      label_color VARCHAR(20) DEFAULT '#ff3b30',
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_label (room_id, user_id),
-      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS room_seats (
+      reason VARCHAR(200),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (from_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (to_user_id) REFERENCES users(id) ON DELETE CASCADE,
+      INDEX idx_to_user_id (to_user_id),
+      INDEX idx_created_at (created_at)
+    )`,
+    
+    // Voice seats table
+    `CREATE TABLE IF NOT EXISTS voice_seats (
       id INT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
       seat_index INT NOT NULL,
-      user_id INT NULL,
+      user_id INT,
+      is_locked BOOLEAN DEFAULT FALSE,
+      is_muted BOOLEAN DEFAULT FALSE,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_seat (room_id, seat_index),
-      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
-    )
-  `);
-
-  // ---- V2 migrations (safe adds) ----
-  await tryExec(`ALTER TABLE users ADD COLUMN avatar_url TEXT NULL`);
-  await tryExec(`ALTER TABLE users ADD COLUMN bio TEXT NULL`);
-  await tryExec(`ALTER TABLE users ADD COLUMN links_json JSON NULL`);
-  await tryExec(`ALTER TABLE users ADD COLUMN verified TINYINT DEFAULT 0`);
-  await tryExec(`ALTER TABLE users ADD COLUMN frame_id INT NULL`);
-
-  await tryExec(`ALTER TABLE rooms ADD COLUMN description TEXT NULL`);
-  await tryExec(`ALTER TABLE rooms ADD COLUMN image_url TEXT NULL`);
-
-  await tryExec(`ALTER TABLE room_settings ADD COLUMN chat_locked TINYINT DEFAULT 0`);
-  await tryExec(`ALTER TABLE room_settings ADD COLUMN voice_enabled TINYINT DEFAULT 1`);
-  await tryExec(`ALTER TABLE room_settings ADD COLUMN voice_seats_count INT DEFAULT 8`);
-
-  await tryExec(`ALTER TABLE messages ADD COLUMN type VARCHAR(24) DEFAULT 'text'`);
-  await tryExec(`ALTER TABLE messages ADD COLUMN metadata JSON NULL`);
-  await tryExec(`ALTER TABLE messages ADD COLUMN deleted_at DATETIME NULL`);
-
-  await tryExec(`ALTER TABLE room_seats ADD COLUMN seat_locked TINYINT DEFAULT 0`);
-  await tryExec(`ALTER TABLE room_seats ADD COLUMN seat_muted TINYINT DEFAULT 0`);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS room_voice_bans (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      room_id INT NOT NULL,
-      user_id INT NOT NULL,
-      banned TINYINT DEFAULT 1,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_voice_ban (room_id, user_id),
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS frames (
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+      UNIQUE KEY unique_room_seat (room_id, seat_index),
+      INDEX idx_room_id (room_id),
+      INDEX idx_user_id (user_id)
+    )`,
+    
+    // Bots table
+    `CREATE TABLE IF NOT EXISTS bots (
       id INT AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(60) NOT NULL,
-      description VARCHAR(160) NULL,
-      css_class VARCHAR(80) NULL,
-      image_url TEXT NULL,
-      price_points INT DEFAULT 0,
-      category VARCHAR(30) DEFAULT 'normal',
-      available TINYINT DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS user_frames (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      frame_id INT NOT NULL,
-      acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_user_frame (user_id, frame_id),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS payment_methods (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      method_key VARCHAR(40) UNIQUE NOT NULL,
-      display_name VARCHAR(60) NOT NULL,
-      enabled TINYINT DEFAULT 1,
-      config_json JSON NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      plan_key VARCHAR(40) UNIQUE NOT NULL,
-      display_name VARCHAR(60) NOT NULL,
-      price_usd DECIMAL(10,2) DEFAULT 0,
-      price_points INT DEFAULT 0,
-      features_json JSON NULL,
-      enabled TINYINT DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS user_subscriptions (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      subscription_id INT NOT NULL,
-      status ENUM('active','expired','canceled','pending') DEFAULT 'pending',
-      started_at DATETIME NULL,
-      expires_at DATETIME NULL,
-      payment_method_id INT NULL,
-      meta_json JSON NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_user_sub (user_id, status),
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
-      FOREIGN KEY (payment_method_id) REFERENCES payment_methods(id) ON DELETE SET NULL
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS bots (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
-      name VARCHAR(60) NOT NULL,
-      avatar_url TEXT NULL,
-      enabled TINYINT DEFAULT 1,
+      name VARCHAR(100) NOT NULL,
+      avatar_url TEXT,
       created_by INT NOT NULL,
+      enabled BOOLEAN DEFAULT TRUE,
+      settings_json JSON DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
-    )
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS bot_commands (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      bot_id BIGINT NOT NULL,
-      trigger_text VARCHAR(80) NOT NULL,
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE,
+      INDEX idx_room_id (room_id),
+      INDEX idx_enabled (enabled)
+    )`,
+    
+    // Bot commands table
+    `CREATE TABLE IF NOT EXISTS bot_commands (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      bot_id INT NOT NULL,
+      trigger_text VARCHAR(200) NOT NULL,
       response_text TEXT NOT NULL,
-      match_mode ENUM('exact','starts_with','contains') DEFAULT 'exact',
-      enabled TINYINT DEFAULT 1,
+      match_type ENUM('exact', 'starts_with', 'contains') DEFAULT 'exact',
+      enabled BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE,
+      INDEX idx_bot_id (bot_id),
+      INDEX idx_enabled (enabled)
+    )`,
+    
+    // Subscriptions table
+    `CREATE TABLE IF NOT EXISTS subscriptions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      plan_key VARCHAR(50) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      price_usd DECIMAL(10,2) DEFAULT 0.00,
+      price_points INT DEFAULT 0,
+      duration_days INT DEFAULT 30,
+      features_json JSON,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_is_active (is_active)
+    )`,
+    
+    // User subscriptions table
+    `CREATE TABLE IF NOT EXISTS user_subscriptions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      subscription_id INT NOT NULL,
+      status ENUM('active', 'expired', 'canceled', 'pending') DEFAULT 'pending',
+      start_date TIMESTAMP NULL,
+      end_date TIMESTAMP NULL,
+      payment_method VARCHAR(50),
+      transaction_id VARCHAR(100),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_bot_trigger (bot_id, trigger_text),
-      FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
-    )
-  `);
-
-  // seed payment method placeholder
-  await pool.execute(
-    `INSERT IGNORE INTO payment_methods(method_key, display_name, enabled, config_json)
-     VALUES ('master_iraq', 'Master عراق', 1, JSON_OBJECT('note','Placeholder gateway module'))`
-  );
-
-  console.log("✅ Tables ready (v2)");
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+      UNIQUE KEY unique_user_subscription (user_id, subscription_id, status),
+      INDEX idx_user_id (user_id),
+      INDEX idx_status (status)
+    )`,
+    
+    // Payment methods table
+    `CREATE TABLE IF NOT EXISTS payment_methods (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      method_key VARCHAR(50) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      is_active BOOLEAN DEFAULT TRUE,
+      config_json JSON,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_is_active (is_active)
+    )`,
+    
+    // Server settings table
+    `CREATE TABLE IF NOT EXISTS server_settings (
+      setting_key VARCHAR(100) PRIMARY KEY,
+      setting_value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+  ];
+  
+  for (const tableSql of tables) {
+    try {
+      await pool.execute(tableSql);
+    } catch (error) {
+      console.error("Error creating table:", error.message);
+    }
+  }
+  
+  console.log("✅ All tables created successfully");
 }
 
-async function initializeDatabase() {
-  pool = await mysql.createPool(DB_CONFIG);
-  await createTablesIfNotExist();
-  await ensureJwtSecret();
-}
-
-/* ================== AUTH MIDDLEWARE ================== */
-function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "NO_TOKEN" });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "BAD_TOKEN" });
+async function createDefaultAdmin() {
+  const adminExists = await dbOne("SELECT id FROM users WHERE username = ?", ["admin"]);
+  
+  if (!adminExists) {
+    const adminPassword = await hashPassword("admin123");
+    const referralCode = crypto.randomBytes(8).toString("hex").toUpperCase();
+    
+    await pool.execute(
+      `INSERT INTO users (username, email, password_hash, is_developer, verified, points, avatar_url, bio, referral_code, settings_json) 
+       VALUES (?, ?, ?, TRUE, TRUE, 10000, ?, ?, ?, ?)`,
+      [
+        "admin",
+        "admin@profilehub.com",
+        adminPassword,
+        "https://ui-avatars.com/api/?name=Admin&background=007AFF&color=fff&size=150",
+        "مدير النظام - يمكنني مساعدتك في أي شيء",
+        referralCode,
+        JSON.stringify({
+          theme: "auto",
+          language: "ar",
+          notifications: true,
+          sound: true,
+          privacy: "public"
+        })
+      ]
+    );
+    
+    console.log("✅ Default admin user created");
   }
 }
 
-/* ================== PERMISSIONS ================== */
-function roleRank(role) {
-  if (role === "owner") return 3;
-  if (role === "developer") return 2;
-  return 1;
-}
-function isMuted(member) {
-  if (!member?.muted_until) return false;
-  return new Date(member.muted_until).getTime() > Date.now();
-}
-async function getRoomAndMember(roomId, userId) {
-  const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
-  if (!room) return { room: null, member: null };
-  const member = await dbOne("SELECT * FROM room_members WHERE room_id=? AND user_id=? LIMIT 1", [roomId, userId]);
-  return { room, member };
-}
-async function ensureMember(roomId, userId) {
-  return await dbOne("SELECT * FROM room_members WHERE room_id=? AND user_id=? LIMIT 1", [roomId, userId]);
-}
-async function ensureCanModerate(roomId, userId) {
-  const m = await ensureMember(roomId, userId);
-  return m ? roleRank(m.role) >= 2 : false;
-}
-async function ensureCanOwner(roomId, userId) {
-  const m = await ensureMember(roomId, userId);
-  return m?.role === "owner";
-}
+// ================== REST API ROUTES ==================
 
-/* ================== REST API ================== */
-app.get("/", (req, res) => res.send("OK"));
+// ===== Health Check =====
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    name: "ProfileHub API",
+    version: "2.0.0",
+    timestamp: new Date().toISOString()
+  });
+});
 
-/** Auth (keep old + add new aliases) */
-app.post(["/api/register", "/auth/register"], async (req, res) => {
-  const { username, email, password } = req.body || {};
-  if (!username || !email || !password) return res.status(400).json({ error: "MISSING_FIELDS" });
-
+app.get("/health", async (req, res) => {
   try {
-    const ph = pbkdf2Hash(password);
-    await pool.execute(
-      "INSERT INTO users (username,email,pass_hash) VALUES (?,?,?)",
-      [String(username).trim(), String(email).trim().toLowerCase(), ph]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: "USER_EXISTS" });
+    await pool.execute("SELECT 1");
+    res.json({
+      status: "healthy",
+      database: "connected",
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "unhealthy",
+      database: "disconnected",
+      error: error.message
+    });
   }
 });
 
-app.post(["/api/login", "/auth/login"], async (req, res) => {
+// ===== Authentication Routes =====
+app.post("/api/register", async (req, res) => {
   try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_FIELDS"
-      });
+    const { username, email, password, referral_code } = req.body;
+    
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "MISSING_FIELDS" });
     }
-
-    const identifier = email.trim().toLowerCase();
-    const isEmail = identifier.includes("@");
-
+    
+    if (password.length < 6) {
+      return res.status(400).json({ error: "PASSWORD_TOO_SHORT" });
+    }
+    
+    // Check if username or email already exists
+    const existingUser = await dbOne(
+      "SELECT id FROM users WHERE username = ? OR email = ?",
+      [username, email.toLowerCase()]
+    );
+    
+    if (existingUser) {
+      return res.status(400).json({ error: "USER_ALREADY_EXISTS" });
+    }
+    
+    // Hash password
+    const passwordHash = await hashPassword(password);
+    const referralCode = crypto.randomBytes(6).toString("hex").toUpperCase();
+    
+    // Check referral code
+    let referredBy = null;
+    let bonusPoints = 0;
+    
+    if (referral_code) {
+      const referrer = await dbOne(
+        "SELECT id FROM users WHERE referral_code = ?",
+        [referral_code]
+      );
+      
+      if (referrer) {
+        referredBy = referrer.id;
+        bonusPoints = 1000; // Give 1000 points for using referral code
+        
+        // Give points to referrer as well
+        await pool.execute(
+          "UPDATE users SET points = points + 500 WHERE id = ?",
+          [referrer.id]
+        );
+        
+        await pool.execute(
+          "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
+          [referrer.id, 500, `إحالة: ${username}`]
+        );
+      }
+    }
+    
+    // Create user
+    const [result] = await pool.execute(
+      `INSERT INTO users (username, email, password_hash, points, referral_code, referred_by, settings_json) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        username,
+        email.toLowerCase(),
+        passwordHash,
+        100 + bonusPoints, // Starting points + referral bonus
+        referralCode,
+        referredBy,
+        JSON.stringify({
+          theme: "auto",
+          language: "ar",
+          notifications: true,
+          sound: true,
+          privacy: "public"
+        })
+      ]
+    );
+    
+    const userId = result.insertId;
+    
+    // Add referral transaction if bonus points given
+    if (bonusPoints > 0) {
+      await pool.execute(
+        "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
+        [userId, bonusPoints, "مكافأة التسجيل بكود دعوة"]
+      );
+    }
+    
+    // Get user data
     const user = await dbOne(
-      isEmail
-        ? "SELECT * FROM users WHERE email = ? LIMIT 1"
-        : "SELECT * FROM users WHERE username = ? LIMIT 1",
-      [identifier]
+      "SELECT id, username, email, is_developer, verified, points, avatar_url, bio, frame_id, created_at FROM users WHERE id = ?",
+      [userId]
     );
-
-    if (!user) {
-      return res.status(401).json({
-        ok: false,
-        error: "BAD_CREDENTIALS"
-      });
-    }
-
-    if (user.banned) {
-      return res.status(403).json({
-        ok: false,
-        error: "BANNED"
-      });
-    }
-
-    const valid = verifyPassword(password, user.pass_hash);
-    if (!valid) {
-      return res.status(401).json({
-        ok: false,
-        error: "BAD_CREDENTIALS"
-      });
-    }
-
-    const token = jwt.sign(
-      {
-        id: user.id,
-        username: user.username,
-        is_developer: !!user.is_developer
-      },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    return res.json({
+    
+    // Generate token
+    const token = generateToken(user);
+    
+    res.json({
       ok: true,
       token,
-      user: {
-        id: user.id,
-        username: user.username,
-        is_developer: !!user.is_developer
-      }
+      user
     });
-
-  } catch (err) {
-    console.error("LOGIN ERROR:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "SERVER_ERROR"
-    });
+    
+  } catch (error) {
+    console.error("Registration error:", error);
+    res.status(500).json({ error: "SERVER_ERROR", message: error.message });
   }
 });
 
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: "MISSING_FIELDS" });
+    }
+    
+    // Find user by email or username
+    const user = await dbOne(
+      "SELECT id, username, email, password_hash, is_developer, verified, points, banned, avatar_url, bio, frame_id, created_at FROM users WHERE email = ? OR username = ?",
+      [email.toLowerCase(), email]
+    );
+    
+    if (!user) {
+      return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+    }
+    
+    if (user.banned) {
+      return res.status(403).json({ error: "ACCOUNT_BANNED" });
+    }
+    
+    // Verify password
+    const validPassword = await verifyPassword(password, user.password_hash);
+    if (!validPassword) {
+      return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+    }
+    
+    // Update last seen
+    await pool.execute(
+      "UPDATE users SET last_seen = ? WHERE id = ?",
+      [nowIso(), user.id]
+    );
+    
+    // Remove password hash from response
+    delete user.password_hash;
+    
+    // Generate token
+    const token = generateToken(user);
+    
+    res.json({
+      ok: true,
+      token,
+      user
+    });
+    
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "SERVER_ERROR", message: error.message });
+  }
+});
+
+// ===== Profile Routes =====
 app.get("/api/me", authMiddleware, async (req, res) => {
-  const u = await dbOne(
-    "SELECT id,username,email,avatar_url,bio,links_json,is_developer,verified,frame_id,points,banned,created_at FROM users WHERE id=? LIMIT 1",
-    [req.user.id]
-  );
-  res.json({ ok: true, user: u });
+  try {
+    res.json({
+      ok: true,
+      user: req.user
+    });
+  } catch (error) {
+    console.error("Get profile error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-/** Profile */
-app.get("/profile", authMiddleware, async (req, res) => {
-  const u = await dbOne(
-    "SELECT id,username,avatar_url,bio,links_json,verified,frame_id,points,is_developer FROM users WHERE id=? LIMIT 1",
-    [req.user.id]
-  );
-  res.json({ ok: true, profile: u });
+app.put("/api/profile", authMiddleware, async (req, res) => {
+  try {
+    const { avatar_url, bio, links_json, frame_id } = req.body;
+    
+    const updates = [];
+    const params = [];
+    
+    if (avatar_url !== undefined) {
+      updates.push("avatar_url = ?");
+      params.push(avatar_url);
+    }
+    
+    if (bio !== undefined) {
+      updates.push("bio = ?");
+      params.push(bio);
+    }
+    
+    if (links_json !== undefined) {
+      updates.push("links_json = ?");
+      params.push(JSON.stringify(links_json));
+    }
+    
+    if (frame_id !== undefined) {
+      // Check if user owns the frame
+      if (frame_id !== null) {
+        const ownsFrame = await dbOne(
+          "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
+          [req.user.id, frame_id]
+        );
+        
+        if (!ownsFrame) {
+          return res.status(403).json({ error: "FRAME_NOT_OWNED" });
+        }
+      }
+      
+      updates.push("frame_id = ?");
+      params.push(frame_id);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "NO_UPDATES" });
+    }
+    
+    params.push(req.user.id);
+    
+    await pool.execute(
+      `UPDATE users SET ${updates.join(", ")} WHERE id = ?`,
+      params
+    );
+    
+    // Get updated user
+    const updatedUser = await dbOne(
+      "SELECT id, username, email, is_developer, verified, points, avatar_url, bio, links_json, frame_id, created_at FROM users WHERE id = ?",
+      [req.user.id]
+    );
+    
+    res.json({
+      ok: true,
+      user: updatedUser
+    });
+    
+  } catch (error) {
+    console.error("Update profile error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-app.put("/profile", authMiddleware, async (req, res) => {
-  const avatar_url = req.body?.avatar_url ?? null;
-  const bio = req.body?.bio ?? null;
-  const links_json = req.body?.links_json ?? null;
-
-  await pool.execute(
-    "UPDATE users SET avatar_url=?, bio=?, links_json=? WHERE id=?",
-    [avatar_url, bio, links_json ? JSON.stringify(links_json) : null, req.user.id]
-  );
-
-  res.json({ ok: true });
-});
-
-/** Rooms */
+// ===== Rooms Routes =====
 app.get("/api/rooms", authMiddleware, async (req, res) => {
-  const [rows] = await pool.execute(
-    `SELECT r.*,
-      (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id=r.id AND rm.banned=0) AS members_count
-     FROM rooms r
-     ORDER BY r.id DESC
-     LIMIT 200`
-  );
-  res.json({ ok: true, rooms: rows });
+  try {
+    const rooms = await dbAll(`
+      SELECT r.*, 
+             u.username as owner_name,
+             u.avatar_url as owner_avatar,
+             (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id AND rm.is_banned = FALSE) as member_count
+      FROM rooms r
+      LEFT JOIN users u ON r.owner_id = u.id
+      ORDER BY r.created_at DESC
+      LIMIT 100
+    `);
+    
+    res.json({
+      ok: true,
+      rooms
+    });
+  } catch (error) {
+    console.error("Get rooms error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
 app.post("/api/rooms", authMiddleware, async (req, res) => {
-  const { name, type, description, image_url } = req.body || {};
-  const roomName = String(name || "").trim();
-  const roomType = type === "voice" ? "voice" : "text";
-  if (!roomName) return res.status(400).json({ error: "NAME_REQUIRED" });
-
-  const [r] = await pool.execute(
-    "INSERT INTO rooms (name,type,owner_user_id,description,image_url) VALUES (?,?,?,?,?)",
-    [roomName, roomType, req.user.id, description || null, image_url || null]
-  );
-  const roomId = r.insertId;
-
-  await pool.execute("INSERT INTO room_members (room_id,user_id,role) VALUES (?,?, 'owner')", [roomId, req.user.id]);
-
-  await pool.execute(
-    "INSERT INTO room_settings (room_id,auto_delete_limit,chat_disabled,chat_locked,voice_enabled,voice_seats_count) VALUES (?,?,?,?,?,?)",
-    [roomId, 0, 0, 0, 1, 8]
-  );
-
-  // init seats if voice
-  if (roomType === "voice") {
-    const seats = [];
-    for (let i = 1; i <= 8; i++) seats.push([roomId, i, null, 0, 0]);
-    await pool.query(
-      "INSERT IGNORE INTO room_seats (room_id, seat_index, user_id, seat_locked, seat_muted) VALUES ?",
-      [seats]
+  try {
+    const { name, description, type, icon, price_points, max_members, voice_seats } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: "ROOM_NAME_REQUIRED" });
+    }
+    
+    const [roomResult] = await pool.execute(
+      `INSERT INTO rooms (name, description, type, icon, owner_id, price_points, max_members, voice_seats, settings_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        name,
+        description || "",
+        type || "text",
+        icon || "💬",
+        req.user.id,
+        price_points || 0,
+        max_members || 100,
+        voice_seats || 8,
+        JSON.stringify({
+          auto_delete_limit: 0,
+          chat_locked: false,
+          voice_enabled: true
+        })
+      ]
     );
+    
+    const roomId = roomResult.insertId;
+    
+    // Add creator as owner member
+    await pool.execute(
+      "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'owner')",
+      [roomId, req.user.id]
+    );
+    
+    // Create voice seats if voice room
+    if (type === "voice") {
+      const seats = [];
+      for (let i = 1; i <= (voice_seats || 8); i++) {
+        seats.push([roomId, i, null, 0, 0]);
+      }
+      
+      if (seats.length > 0) {
+        await pool.query(
+          "INSERT INTO voice_seats (room_id, seat_index, user_id, is_locked, is_muted) VALUES ?",
+          [seats]
+        );
+      }
+    }
+    
+    // Get created room
+    const room = await dbOne(`
+      SELECT r.*, 
+             u.username as owner_name,
+             u.avatar_url as owner_avatar
+      FROM rooms r
+      LEFT JOIN users u ON r.owner_id = u.id
+      WHERE r.id = ?
+    `, [roomId]);
+    
+    res.json({
+      ok: true,
+      room,
+      room_id: roomId
+    });
+    
+  } catch (error) {
+    console.error("Create room error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
   }
-
-  res.json({ ok: true, room_id: roomId });
 });
 
 app.get("/api/rooms/:id", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
-  if (!room) return res.status(404).json({ error: "NOT_FOUND" });
-
-  const settings = await dbOne("SELECT * FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
-
-  const [members] = await pool.execute(
-    `SELECT rm.user_id, rm.role, rm.muted_until, rm.restricted, rm.banned,
-            u.username, u.is_developer, u.points, u.verified, u.frame_id,
-            rl.label_text, rl.label_color
-     FROM room_members rm
-     JOIN users u ON u.id=rm.user_id
-     LEFT JOIN room_labels rl ON rl.room_id=rm.room_id AND rl.user_id=rm.user_id
-     WHERE rm.room_id=?
-     ORDER BY FIELD(rm.role,'owner','developer','member'), rm.joined_at ASC`,
-    [roomId]
-  );
-
-  let seats = [];
-  if (room.type === "voice") {
-    const [s] = await pool.execute(
-      "SELECT seat_index, user_id, seat_locked, seat_muted FROM room_seats WHERE room_id=? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    seats = s;
+  try {
+    const roomId = mustInt(req.params.id);
+    
+    const room = await dbOne(`
+      SELECT r.*, 
+             u.username as owner_name,
+             u.avatar_url as owner_avatar,
+             (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id AND rm.is_banned = FALSE) as member_count
+      FROM rooms r
+      LEFT JOIN users u ON r.owner_id = u.id
+      WHERE r.id = ?
+    `, [roomId]);
+    
+    if (!room) {
+      return res.status(404).json({ error: "ROOM_NOT_FOUND" });
+    }
+    
+    // Get room members
+    const members = await dbAll(`
+      SELECT rm.*, 
+             u.username, 
+             u.avatar_url, 
+             u.is_developer,
+             u.verified,
+             u.points,
+             uf.frame_id
+      FROM room_members rm
+      LEFT JOIN users u ON rm.user_id = u.id
+      LEFT JOIN user_frames uf ON u.id = uf.user_id AND uf.frame_id = u.frame_id
+      WHERE rm.room_id = ? AND rm.is_banned = FALSE
+      ORDER BY 
+        CASE rm.role 
+          WHEN 'owner' THEN 1
+          WHEN 'admin' THEN 2
+          ELSE 3
+        END,
+        rm.joined_at ASC
+    `, [roomId]);
+    
+    // Get voice seats if voice room
+    let seats = [];
+    if (room.type === "voice") {
+      seats = await dbAll(
+        "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+        [roomId]
+      );
+    }
+    
+    // Check if user is member
+    const isMember = members.some(m => m.user_id === req.user.id);
+    
+    res.json({
+      ok: true,
+      room,
+      members,
+      seats,
+      is_member: isMember
+    });
+    
+  } catch (error) {
+    console.error("Get room error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
   }
-
-  res.json({ ok: true, room, settings, members, seats });
 });
 
-/** Messages REST (history/edit/delete) */
+app.delete("/api/rooms/:id", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    
+    const room = await dbOne("SELECT owner_id FROM rooms WHERE id = ?", [roomId]);
+    
+    if (!room) {
+      return res.status(404).json({ error: "ROOM_NOT_FOUND" });
+    }
+    
+    // Check if user is owner or developer
+    const isOwner = room.owner_id === req.user.id;
+    const isDeveloper = req.user.is_developer;
+    
+    if (!isOwner && !isDeveloper) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    await pool.execute("DELETE FROM rooms WHERE id = ?", [roomId]);
+    
+    res.json({
+      ok: true,
+      message: "Room deleted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Delete room error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ===== Messages Routes =====
 app.get("/api/rooms/:id/messages", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const limit = Math.min(200, Math.max(1, mustInt(req.query.limit, 50)));
-  const beforeId = mustInt(req.query.before_id, 0);
-
-  let sql =
-    `SELECT m.id, m.room_id, m.user_id, m.text, m.type, m.metadata, m.created_at, m.edited_at, m.deleted, m.deleted_at,
-            u.username, u.verified, u.frame_id,
-            rl.label_text, rl.label_color
-     FROM messages m
-     JOIN users u ON u.id=m.user_id
-     LEFT JOIN room_labels rl ON rl.room_id=m.room_id AND rl.user_id=m.user_id
-     WHERE m.room_id=? `;
-  const params = [roomId];
-
-  if (beforeId > 0) { sql += " AND m.id < ? "; params.push(beforeId); }
-  sql += " ORDER BY m.id DESC LIMIT ? ";
-  params.push(limit);
-
-  const [rows] = await pool.execute(sql, params);
-  res.json({ ok: true, messages: rows.reverse() });
+  try {
+    const roomId = mustInt(req.params.id);
+    const limit = mustInt(req.query.limit, 50);
+    const beforeId = mustInt(req.query.before_id, 0);
+    
+    // Check if user is room member
+    const isMember = await dbOne(
+      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+      [roomId, req.user.id]
+    );
+    
+    if (!isMember) {
+      return res.status(403).json({ error: "NOT_ROOM_MEMBER" });
+    }
+    
+    let query = `
+      SELECT m.*, 
+             u.username,
+             u.avatar_url,
+             u.is_developer,
+             u.verified,
+             rm.label_text,
+             rm.label_color
+      FROM messages m
+      LEFT JOIN users u ON m.user_id = u.id
+      LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+      WHERE m.room_id = ? AND m.deleted = FALSE
+    `;
+    
+    const params = [roomId];
+    
+    if (beforeId > 0) {
+      query += " AND m.id < ?";
+      params.push(beforeId);
+    }
+    
+    query += " ORDER BY m.id DESC LIMIT ?";
+    params.push(limit);
+    
+    const messages = await dbAll(query, params);
+    
+    // Reverse to get chronological order
+    messages.reverse();
+    
+    res.json({
+      ok: true,
+      messages
+    });
+    
+  } catch (error) {
+    console.error("Get messages error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-app.put("/messages/:id", authMiddleware, async (req, res) => {
-  const messageId = Number(req.params.id);
-  const text = String(req.body?.text || "").trim();
-  if (!messageId || !text) return res.status(400).json({ error: "BAD_INPUT" });
-
-  const m = await dbOne("SELECT * FROM messages WHERE id=? LIMIT 1", [messageId]);
-  if (!m || m.deleted) return res.status(404).json({ error: "NOT_FOUND" });
-
-  const member = await ensureMember(m.room_id, req.user.id);
-  if (!member) return res.status(403).json({ error: "NOT_MEMBER" });
-
-  const can = (m.user_id === req.user.id) || roleRank(member.role) >= 2;
-  if (!can) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  await pool.execute("UPDATE messages SET text=?, edited_at=NOW() WHERE id=?", [text, messageId]);
-  broadcastRoom(m.room_id, { type: "message_updated", room_id: m.room_id, message_id: messageId, text, edited_at: nowIso() });
-
-  res.json({ ok: true });
+app.put("/api/messages/:id", authMiddleware, async (req, res) => {
+  try {
+    const messageId = mustInt(req.params.id);
+    const { text } = req.body;
+    
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: "EMPTY_MESSAGE" });
+    }
+    
+    // Get message
+    const message = await dbOne(
+      "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
+      [messageId]
+    );
+    
+    if (!message) {
+      return res.status(404).json({ error: "MESSAGE_NOT_FOUND" });
+    }
+    
+    // Check permissions
+    const isOwner = message.user_id === req.user.id;
+    const canModerate = await canModerateRoom(message.room_id, req.user.id);
+    
+    if (!isOwner && !canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Update message
+    await pool.execute(
+      "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
+      [text.trim(), nowIso(), messageId]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Message updated successfully"
+    });
+    
+  } catch (error) {
+    console.error("Update message error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-app.delete("/messages/:id", authMiddleware, async (req, res) => {
-  const messageId = Number(req.params.id);
-  if (!messageId) return res.status(400).json({ error: "BAD_INPUT" });
-
-  const m = await dbOne("SELECT * FROM messages WHERE id=? LIMIT 1", [messageId]);
-  if (!m || m.deleted) return res.status(404).json({ error: "NOT_FOUND" });
-
-  const member = await ensureMember(m.room_id, req.user.id);
-  if (!member) return res.status(403).json({ error: "NOT_MEMBER" });
-
-  const can = (m.user_id === req.user.id) || roleRank(member.role) >= 2;
-  if (!can) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  await pool.execute("UPDATE messages SET deleted=1, deleted_at=NOW() WHERE id=?", [messageId]);
-  broadcastRoom(m.room_id, { type: "message_deleted", room_id: m.room_id, message_id: messageId });
-
-  res.json({ ok: true });
+app.delete("/api/messages/:id", authMiddleware, async (req, res) => {
+  try {
+    const messageId = mustInt(req.params.id);
+    
+    // Get message
+    const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
+    
+    if (!message) {
+      return res.status(404).json({ error: "MESSAGE_NOT_FOUND" });
+    }
+    
+    // Check permissions
+    const isOwner = message.user_id === req.user.id;
+    const canModerate = await canModerateRoom(message.room_id, req.user.id);
+    
+    if (!isOwner && !canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Delete message
+    await pool.execute(
+      "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
+      [req.user.id, nowIso(), messageId]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Message deleted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Delete message error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-/** Room settings REST */
-app.post("/api/rooms/:id/autodelete", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const limit = mustInt(req.body?.limit, 0);
-  const { room, member } = await getRoomAndMember(roomId, req.user.id);
-  if (!room || !member) return res.status(404).json({ error: "NOT_FOUND_OR_NOT_MEMBER" });
-  if (roleRank(member.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
+// ===== Points Routes =====
+app.post("/api/points/grant", authMiddleware, async (req, res) => {
+  try {
+    const { to_user_id, amount, reason } = req.body;
+    
+    if (!to_user_id || !amount || amount <= 0) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Only developers can grant points
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Check if target user exists
+    const targetUser = await dbOne("SELECT id FROM users WHERE id = ?", [to_user_id]);
+    if (!targetUser) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+    
+    // Grant points
+    await pool.execute(
+      "UPDATE users SET points = points + ? WHERE id = ?",
+      [amount, to_user_id]
+    );
+    
+    // Record transaction
+    await pool.execute(
+      "INSERT INTO point_transactions (from_user_id, to_user_id, amount, reason) VALUES (?, ?, ?, ?)",
+      [req.user.id, to_user_id, amount, reason || "منح من المطور"]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Points granted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Grant points error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
 
-  await pool.execute("UPDATE room_settings SET auto_delete_limit=? WHERE room_id=?", [Math.max(0, Math.min(500, limit)), roomId]);
-  res.json({ ok: true });
+app.post("/api/points/deduct", authMiddleware, async (req, res) => {
+  try {
+    const { to_user_id, amount, reason } = req.body;
+    
+    if (!to_user_id || !amount || amount <= 0) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Only developers can deduct points
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Check if target user exists
+    const targetUser = await dbOne("SELECT id, points FROM users WHERE id = ?", [to_user_id]);
+    if (!targetUser) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+    
+    // Ensure user doesn't go below 0
+    const newPoints = Math.max(0, targetUser.points - amount);
+    
+    // Deduct points
+    await pool.execute(
+      "UPDATE users SET points = ? WHERE id = ?",
+      [newPoints, to_user_id]
+    );
+    
+    // Record transaction
+    await pool.execute(
+      "INSERT INTO point_transactions (from_user_id, to_user_id, amount, reason) VALUES (?, ?, ?, ?)",
+      [req.user.id, to_user_id, -amount, reason || "خصم من المطور"]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Points deducted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Deduct points error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ===== Moderation Routes =====
+app.post("/api/rooms/:id/mute", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    const { target_user_id, minutes, reason } = req.body;
+    
+    if (!target_user_id || !minutes) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Calculate mute until time
+    const muteUntil = new Date(Date.now() + minutes * 60000);
+    
+    // Update user mute status
+    await pool.execute(
+      "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
+      [muteUntil, roomId, target_user_id]
+    );
+    
+    // Add system message
+    await pool.execute(
+      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+      [roomId, `تم كتم المستخدم لمدة ${minutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`]
+    );
+    
+    res.json({
+      ok: true,
+      message: "User muted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Mute user error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/rooms/:id/ban", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    const { target_user_id, reason } = req.body;
+    
+    if (!target_user_id) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Ban user
+    await pool.execute(
+      "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
+      [roomId, target_user_id]
+    );
+    
+    // Remove from voice seats
+    await pool.execute(
+      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+      [roomId, target_user_id]
+    );
+    
+    // Add system message
+    await pool.execute(
+      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+      [roomId, `تم حظر المستخدم من الغرفة${reason ? ` - السبب: ${reason}` : ''}`]
+    );
+    
+    res.json({
+      ok: true,
+      message: "User banned successfully"
+    });
+    
+  } catch (error) {
+    console.error("Ban user error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/rooms/:id/unban", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    const { target_user_id } = req.body;
+    
+    if (!target_user_id) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Unban user
+    await pool.execute(
+      "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
+      [roomId, target_user_id]
+    );
+    
+    res.json({
+      ok: true,
+      message: "User unbanned successfully"
+    });
+    
+  } catch (error) {
+    console.error("Unban user error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/rooms/:id/restrict", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    const { target_user_id, reason } = req.body;
+    
+    if (!target_user_id) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Restrict user (mute indefinitely)
+    await pool.execute(
+      "UPDATE room_members SET muted_until = '2030-01-01 00:00:00' WHERE room_id = ? AND user_id = ?",
+      [roomId, target_user_id]
+    );
+    
+    // Add system message
+    await pool.execute(
+      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+      [roomId, `تم تقييد المستخدم${reason ? ` - السبب: ${reason}` : ''}`]
+    );
+    
+    res.json({
+      ok: true,
+      message: "User restricted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Restrict user error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
 app.post("/api/rooms/:id/chat-lock", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const locked = req.body?.locked ? 1 : 0;
-  const { room, member } = await getRoomAndMember(roomId, req.user.id);
-  if (!room || !member) return res.status(404).json({ error: "NOT_FOUND_OR_NOT_MEMBER" });
-  if (roleRank(member.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  await pool.execute("UPDATE room_settings SET chat_locked=? WHERE room_id=?", [locked, roomId]);
-  broadcastRoom(roomId, { type: locked ? "chat_locked" : "chat_unlocked", room_id: roomId });
-  res.json({ ok: true });
-});
-
-/** Points */
-app.post("/points/grant", authMiddleware, async (req, res) => {
-  const to_user_id = mustInt(req.body?.to_user_id, 0);
-  const amount = mustInt(req.body?.amount, 0);
-  const reason = String(req.body?.reason || "grant");
-  if (!to_user_id || amount <= 0) return res.status(400).json({ error: "BAD_INPUT" });
-
-  // dev only
-  const me = await dbOne("SELECT is_developer FROM users WHERE id=? LIMIT 1", [req.user.id]);
-  if (!me?.is_developer) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  await pool.execute("UPDATE users SET points=points+? WHERE id=?", [amount, to_user_id]);
-  await pool.execute("INSERT INTO point_transactions (from_user_id,to_user_id,amount,reason) VALUES (?,?,?,?)",
-    [req.user.id, to_user_id, amount, reason]);
-
-  res.json({ ok: true });
-});
-
-app.post("/points/deduct", authMiddleware, async (req, res) => {
-  const to_user_id = mustInt(req.body?.to_user_id, 0);
-  const amount = mustInt(req.body?.amount, 0);
-  const reason = String(req.body?.reason || "deduct");
-  if (!to_user_id || amount <= 0) return res.status(400).json({ error: "BAD_INPUT" });
-
-  const me = await dbOne("SELECT is_developer FROM users WHERE id=? LIMIT 1", [req.user.id]);
-  if (!me?.is_developer) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  await pool.execute("UPDATE users SET points=GREATEST(points-?,0) WHERE id=?", [amount, to_user_id]);
-  await pool.execute("INSERT INTO point_transactions (from_user_id,to_user_id,amount,reason) VALUES (?,?,?,?)",
-    [req.user.id, to_user_id, -amount, reason]);
-
-  res.json({ ok: true });
-});
-
-/** Moderation REST (aliases) */
-async function modRequire(roomId, actorId) {
-  const ok = await ensureCanModerate(roomId, actorId);
-  if (!ok) return { ok: false, error: "NO_PERMISSION" };
-  return { ok: true };
-}
-app.post("/rooms/:id/mute", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const target = mustInt(req.body?.target_user_id, 0);
-  const minutes = mustInt(req.body?.minutes, 10);
-  if (!roomId || !target) return res.status(400).json({ error: "BAD_INPUT" });
-  const chk = await modRequire(roomId, req.user.id);
-  if (!chk.ok) return res.status(403).json(chk);
-
-  const until = new Date(Date.now() + Math.max(1, minutes) * 60_000);
-  await pool.execute(
-    "UPDATE room_members SET muted_until=? WHERE room_id=? AND user_id=?",
-    [until.toISOString().slice(0, 19).replace("T", " "), roomId, target]
-  );
-  broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم كتم المستخدم (${target})` });
-  await broadcastMembersSnapshot(roomId);
-  res.json({ ok: true });
-});
-
-app.post("/rooms/:id/ban", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const target = mustInt(req.body?.target_user_id, 0);
-  if (!roomId || !target) return res.status(400).json({ error: "BAD_INPUT" });
-  const chk = await modRequire(roomId, req.user.id);
-  if (!chk.ok) return res.status(403).json(chk);
-
-  await pool.execute("UPDATE room_members SET banned=1 WHERE room_id=? AND user_id=?", [roomId, target]);
-  broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم حظر المستخدم (${target})` });
-  await broadcastMembersSnapshot(roomId);
-  res.json({ ok: true });
-});
-
-app.post("/rooms/:id/restrict", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const target = mustInt(req.body?.target_user_id, 0);
-  const restricted = req.body?.restricted ? 1 : 0;
-  if (!roomId || !target) return res.status(400).json({ error: "BAD_INPUT" });
-  const chk = await modRequire(roomId, req.user.id);
-  if (!chk.ok) return res.status(403).json(chk);
-
-  await pool.execute("UPDATE room_members SET restricted=? WHERE room_id=? AND user_id=?", [restricted, roomId, target]);
-  broadcastRoom(roomId, { type: "system", room_id: roomId, text: restricted ? `تم تقييد الدردشة (${target})` : `تم فك التقييد (${target})` });
-  await broadcastMembersSnapshot(roomId);
-  res.json({ ok: true });
-});
-
-/** Frames */
-app.get("/frames", authMiddleware, async (req, res) => {
-  const [rows] = await pool.execute("SELECT * FROM frames ORDER BY id DESC LIMIT 500");
-  res.json({ ok: true, frames: rows });
-});
-
-// dev CRUD
-app.post("/frames", authMiddleware, async (req, res) => {
-  const me = await dbOne("SELECT is_developer FROM users WHERE id=? LIMIT 1", [req.user.id]);
-  if (!me?.is_developer) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  const name = String(req.body?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "NAME_REQUIRED" });
-
-  const [r] = await pool.execute(
-    "INSERT INTO frames (name,description,css_class,image_url,price_points,category,available) VALUES (?,?,?,?,?,?,?)",
-    [
-      name,
-      req.body?.description || null,
-      req.body?.css_class || null,
-      req.body?.image_url || null,
-      mustInt(req.body?.price_points, 0),
-      req.body?.category || "normal",
-      req.body?.available ? 1 : 0,
-    ]
-  );
-
-  res.json({ ok: true, frame_id: r.insertId });
-});
-
-app.post("/frames/grant", authMiddleware, async (req, res) => {
-  const me = await dbOne("SELECT is_developer FROM users WHERE id=? LIMIT 1", [req.user.id]);
-  if (!me?.is_developer) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  const user_id = mustInt(req.body?.user_id, 0);
-  const frame_id = mustInt(req.body?.frame_id, 0);
-  if (!user_id || !frame_id) return res.status(400).json({ error: "BAD_INPUT" });
-
-  await pool.execute("INSERT IGNORE INTO user_frames (user_id, frame_id) VALUES (?,?)", [user_id, frame_id]);
-  res.json({ ok: true });
-});
-
-app.post("/frames/select", authMiddleware, async (req, res) => {
-  const frame_id = req.body?.frame_id === null ? null : mustInt(req.body?.frame_id, 0);
-  if (frame_id === 0) return res.status(400).json({ error: "BAD_INPUT" });
-
-  // ensure owned if not null
-  if (frame_id !== null) {
-    const owned = await dbOne("SELECT 1 FROM user_frames WHERE user_id=? AND frame_id=? LIMIT 1", [req.user.id, frame_id]);
-    if (!owned) return res.status(403).json({ error: "NOT_OWNED" });
-  }
-
-  await pool.execute("UPDATE users SET frame_id=? WHERE id=?", [frame_id, req.user.id]);
-  res.json({ ok: true });
-});
-
-/** Subscriptions + Payments */
-app.get("/payment-methods", authMiddleware, async (req, res) => {
-  const [rows] = await pool.execute("SELECT id,method_key,display_name,enabled FROM payment_methods ORDER BY id ASC");
-  res.json({ ok: true, methods: rows });
-});
-
-app.get("/subscriptions", authMiddleware, async (req, res) => {
-  const [rows] = await pool.execute("SELECT * FROM subscriptions WHERE enabled=1 ORDER BY id ASC");
-  res.json({ ok: true, plans: rows });
-});
-
-// dev: create plan
-app.post("/subscriptions", authMiddleware, async (req, res) => {
-  const me = await dbOne("SELECT is_developer FROM users WHERE id=? LIMIT 1", [req.user.id]);
-  if (!me?.is_developer) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  const plan_key = String(req.body?.plan_key || "").trim();
-  const display_name = String(req.body?.display_name || "").trim();
-  if (!plan_key || !display_name) return res.status(400).json({ error: "BAD_INPUT" });
-
-  const [r] = await pool.execute(
-    "INSERT INTO subscriptions(plan_key,display_name,price_usd,price_points,features_json,enabled) VALUES (?,?,?,?,?,?)",
-    [
-      plan_key,
-      display_name,
-      Number(req.body?.price_usd || 0),
-      mustInt(req.body?.price_points, 0),
-      req.body?.features_json ? JSON.stringify(req.body.features_json) : null,
-      req.body?.enabled ? 1 : 0,
-    ]
-  );
-
-  res.json({ ok: true, subscription_id: r.insertId });
-});
-
-// user: subscribe request (pending)
-app.post("/subscriptions/subscribe", authMiddleware, async (req, res) => {
-  const subscription_id = mustInt(req.body?.subscription_id, 0);
-  const payment_method_id = mustInt(req.body?.payment_method_id, 0);
-  const months = Math.max(1, mustInt(req.body?.months, 1));
-
-  if (!subscription_id) return res.status(400).json({ error: "BAD_INPUT" });
-
-  await pool.execute(
-    `INSERT INTO user_subscriptions(user_id,subscription_id,status,started_at,expires_at,payment_method_id,meta_json)
-     VALUES (?,?,?,?,?,?,?)`,
-    [
-      req.user.id,
-      subscription_id,
-      "pending",
-      null,
-      null,
-      payment_method_id || null,
-      JSON.stringify({ months, note: "payment pending" }),
-    ]
-  );
-
-  res.json({ ok: true, status: "pending" });
-});
-
-/** Bots */
-app.get("/api/rooms/:id/bots", authMiddleware, async (req, res) => {
-  const roomId = mustInt(req.params.id, 0);
-  const member = await ensureMember(roomId, req.user.id);
-  if (!member || member.banned) return res.status(403).json({ error: "NOT_MEMBER" });
-
-  const [bots] = await pool.execute("SELECT * FROM bots WHERE room_id=? AND enabled=1 ORDER BY id ASC", [roomId]);
-  const botIds = bots.map(b => b.id);
-  let commands = [];
-  if (botIds.length) {
-    const [cmds] = await pool.query(
-      "SELECT * FROM bot_commands WHERE bot_id IN (?) AND enabled=1",
-      [botIds]
+  try {
+    const roomId = mustInt(req.params.id);
+    const { locked, reason } = req.body;
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Update room settings
+    const room = await dbOne("SELECT settings_json FROM rooms WHERE id = ?", [roomId]);
+    const settings = room ? safeJsonParse(room.settings_json) || {} : {};
+    
+    settings.chat_locked = locked === true || locked === 'true' || locked === 1;
+    
+    await pool.execute(
+      "UPDATE rooms SET settings_json = ? WHERE id = ?",
+      [JSON.stringify(settings), roomId]
     );
-    commands = cmds;
+    
+    // Add system message
+    await pool.execute(
+      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+      [roomId, `تم ${settings.chat_locked ? 'قفل' : 'فتح'} الدردشة${reason ? ` - السبب: ${reason}` : ''}`]
+    );
+    
+    res.json({
+      ok: true,
+      message: `Chat ${settings.chat_locked ? 'locked' : 'unlocked'} successfully`
+    });
+    
+  } catch (error) {
+    console.error("Chat lock error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
   }
-  res.json({ ok: true, bots, commands });
+});
+
+app.post("/api/rooms/:id/autodelete", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    const { limit } = req.body;
+    
+    const autoDeleteLimit = mustInt(limit, 0);
+    
+    // Check permissions
+    const canModerate = await canModerateRoom(roomId, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Update room settings
+    const room = await dbOne("SELECT settings_json FROM rooms WHERE id = ?", [roomId]);
+    const settings = room ? safeJsonParse(room.settings_json) || {} : {};
+    
+    settings.auto_delete_limit = autoDeleteLimit;
+    
+    await pool.execute(
+      "UPDATE rooms SET settings_json = ? WHERE id = ?",
+      [JSON.stringify(settings), roomId]
+    );
+    
+    // If auto-delete limit is set, run cleanup
+    if (autoDeleteLimit > 0) {
+      await cleanupOldMessages(roomId, autoDeleteLimit);
+    }
+    
+    res.json({
+      ok: true,
+      message: `Auto-delete limit set to ${autoDeleteLimit} messages`
+    });
+    
+  } catch (error) {
+    console.error("Auto-delete error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ===== Frames Routes =====
+app.get("/api/frames", authMiddleware, async (req, res) => {
+  try {
+    const frames = await dbAll(`
+      SELECT f.*, 
+             u.username as creator_name,
+             (SELECT COUNT(*) FROM user_frames uf WHERE uf.frame_id = f.id) as users_count
+      FROM frames f
+      LEFT JOIN users u ON f.created_by = u.id
+      WHERE f.available = TRUE
+      ORDER BY f.created_at DESC
+    `);
+    
+    // Check which frames user owns
+    const userFrames = await dbAll(
+      "SELECT frame_id FROM user_frames WHERE user_id = ?",
+      [req.user.id]
+    );
+    
+    const ownedFrameIds = userFrames.map(f => f.frame_id);
+    
+    const framesWithOwnership = frames.map(frame => ({
+      ...frame,
+      owned: ownedFrameIds.includes(frame.id),
+      selected: req.user.frame_id === frame.id
+    }));
+    
+    res.json({
+      ok: true,
+      frames: framesWithOwnership
+    });
+    
+  } catch (error) {
+    console.error("Get frames error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/frames", authMiddleware, async (req, res) => {
+  try {
+    const { name, description, css_class, image_url, price_points, category } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: "FRAME_NAME_REQUIRED" });
+    }
+    
+    // Only developers can create frames
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO frames (name, description, css_class, image_url, price_points, category, created_by, available)
+       VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)`,
+      [
+        name,
+        description || "",
+        css_class || "",
+        image_url || "",
+        price_points || 0,
+        category || "basic",
+        req.user.id
+      ]
+    );
+    
+    const frameId = result.insertId;
+    
+    res.json({
+      ok: true,
+      frame_id: frameId,
+      message: "Frame created successfully"
+    });
+    
+  } catch (error) {
+    console.error("Create frame error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/frames/purchase", authMiddleware, async (req, res) => {
+  try {
+    const { frame_id } = req.body;
+    
+    if (!frame_id) {
+      return res.status(400).json({ error: "FRAME_ID_REQUIRED" });
+    }
+    
+    // Get frame
+    const frame = await dbOne(
+      "SELECT id, price_points, available FROM frames WHERE id = ?",
+      [frame_id]
+    );
+    
+    if (!frame) {
+      return res.status(404).json({ error: "FRAME_NOT_FOUND" });
+    }
+    
+    if (!frame.available) {
+      return res.status(400).json({ error: "FRAME_NOT_AVAILABLE" });
+    }
+    
+    // Check if already owned
+    const alreadyOwned = await dbOne(
+      "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
+      [req.user.id, frame_id]
+    );
+    
+    if (alreadyOwned) {
+      return res.status(400).json({ error: "FRAME_ALREADY_OWNED" });
+    }
+    
+    // Check if user has enough points
+    if (frame.price_points > 0 && req.user.points < frame.price_points) {
+      return res.status(400).json({ error: "INSUFFICIENT_POINTS" });
+    }
+    
+    // Deduct points if frame costs points
+    if (frame.price_points > 0) {
+      await pool.execute(
+        "UPDATE users SET points = points - ? WHERE id = ?",
+        [frame.price_points, req.user.id]
+      );
+      
+      // Record transaction
+      await pool.execute(
+        "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
+        [req.user.id, -frame.price_points, `شراء إطار: ${frame_id}`]
+      );
+    }
+    
+    // Add frame to user
+    await pool.execute(
+      "INSERT INTO user_frames (user_id, frame_id) VALUES (?, ?)",
+      [req.user.id, frame_id]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Frame purchased successfully"
+    });
+    
+  } catch (error) {
+    console.error("Purchase frame error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/frames/select", authMiddleware, async (req, res) => {
+  try {
+    const { frame_id } = req.body;
+    
+    // If frame_id is null, user wants to remove frame
+    if (frame_id === null) {
+      await pool.execute(
+        "UPDATE users SET frame_id = NULL WHERE id = ?",
+        [req.user.id]
+      );
+      
+      return res.json({
+        ok: true,
+        message: "Frame removed successfully"
+      });
+    }
+    
+    // Check if user owns the frame
+    const ownsFrame = await dbOne(
+      "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
+      [req.user.id, frame_id]
+    );
+    
+    if (!ownsFrame) {
+      return res.status(403).json({ error: "FRAME_NOT_OWNED" });
+    }
+    
+    // Select frame
+    await pool.execute(
+      "UPDATE users SET frame_id = ? WHERE id = ?",
+      [frame_id, req.user.id]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Frame selected successfully"
+    });
+    
+  } catch (error) {
+    console.error("Select frame error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/frames/grant", authMiddleware, async (req, res) => {
+  try {
+    const { user_id, frame_id } = req.body;
+    
+    if (!user_id || !frame_id) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Only developers can grant frames
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Check if frame exists
+    const frame = await dbOne("SELECT id FROM frames WHERE id = ?", [frame_id]);
+    if (!frame) {
+      return res.status(404).json({ error: "FRAME_NOT_FOUND" });
+    }
+    
+    // Check if user exists
+    const user = await dbOne("SELECT id FROM users WHERE id = ?", [user_id]);
+    if (!user) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+    
+    // Check if already owned
+    const alreadyOwned = await dbOne(
+      "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
+      [user_id, frame_id]
+    );
+    
+    if (alreadyOwned) {
+      return res.status(400).json({ error: "FRAME_ALREADY_OWNED" });
+    }
+    
+    // Grant frame
+    await pool.execute(
+      "INSERT INTO user_frames (user_id, frame_id) VALUES (?, ?)",
+      [user_id, frame_id]
+    );
+    
+    res.json({
+      ok: true,
+      message: "Frame granted successfully"
+    });
+    
+  } catch (error) {
+    console.error("Grant frame error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ===== Subscriptions Routes =====
+app.get("/api/subscriptions", authMiddleware, async (req, res) => {
+  try {
+    const subscriptions = await dbAll(`
+      SELECT * FROM subscriptions 
+      WHERE is_active = TRUE 
+      ORDER BY price_usd ASC, price_points ASC
+    `);
+    
+    res.json({
+      ok: true,
+      subscriptions
+    });
+    
+  } catch (error) {
+    console.error("Get subscriptions error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.get("/api/payment-methods", authMiddleware, async (req, res) => {
+  try {
+    const paymentMethods = await dbAll(`
+      SELECT * FROM payment_methods 
+      WHERE is_active = TRUE 
+      ORDER BY id ASC
+    `);
+    
+    res.json({
+      ok: true,
+      payment_methods: paymentMethods
+    });
+    
+  } catch (error) {
+    console.error("Get payment methods error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/subscriptions/subscribe", authMiddleware, async (req, res) => {
+  try {
+    const { subscription_id, payment_method, months } = req.body;
+    
+    if (!subscription_id || !payment_method) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Get subscription
+    const subscription = await dbOne(
+      "SELECT * FROM subscriptions WHERE id = ? AND is_active = TRUE",
+      [subscription_id]
+    );
+    
+    if (!subscription) {
+      return res.status(404).json({ error: "SUBSCRIPTION_NOT_FOUND" });
+    }
+    
+    // Check payment method
+    const paymentMethod = await dbOne(
+      "SELECT * FROM payment_methods WHERE method_key = ? AND is_active = TRUE",
+      [payment_method]
+    );
+    
+    if (!paymentMethod) {
+      return res.status(400).json({ error: "PAYMENT_METHOD_NOT_AVAILABLE" });
+    }
+    
+    const numMonths = Math.max(1, mustInt(months, 1));
+    const durationDays = subscription.duration_days * numMonths;
+    
+    // Calculate dates
+    const startDate = new Date();
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + durationDays);
+    
+    // Create subscription record
+    const [result] = await pool.execute(
+      `INSERT INTO user_subscriptions (user_id, subscription_id, status, start_date, end_date, payment_method, transaction_id)
+       VALUES (?, ?, 'pending', ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        subscription_id,
+        startDate,
+        endDate,
+        payment_method,
+        `TXN-${Date.now()}-${req.user.id}`
+      ]
+    );
+    
+    res.json({
+      ok: true,
+      subscription_id: result.insertId,
+      message: "Subscription request submitted"
+    });
+    
+  } catch (error) {
+    console.error("Subscribe error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ===== Bots Routes =====
+app.get("/api/rooms/:id/bots", authMiddleware, async (req, res) => {
+  try {
+    const roomId = mustInt(req.params.id);
+    
+    // Check if user is room member
+    const isMember = await dbOne(
+      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+      [roomId, req.user.id]
+    );
+    
+    if (!isMember) {
+      return res.status(403).json({ error: "NOT_ROOM_MEMBER" });
+    }
+    
+    const bots = await dbAll(`
+      SELECT b.*, u.username as creator_name
+      FROM bots b
+      LEFT JOIN users u ON b.created_by = u.id
+      WHERE b.room_id = ? AND b.enabled = TRUE
+      ORDER BY b.created_at ASC
+    `, [roomId]);
+    
+    // Get commands for each bot
+    const botsWithCommands = await Promise.all(
+      bots.map(async (bot) => {
+        const commands = await dbAll(
+          "SELECT * FROM bot_commands WHERE bot_id = ? AND enabled = TRUE ORDER BY created_at ASC",
+          [bot.id]
+        );
+        return { ...bot, commands };
+      })
+    );
+    
+    res.json({
+      ok: true,
+      bots: botsWithCommands
+    });
+    
+  } catch (error) {
+    console.error("Get bots error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
 app.post("/api/bots", authMiddleware, async (req, res) => {
-  const room_id = mustInt(req.body?.room_id, 0);
-  const name = String(req.body?.name || "").trim();
-  const avatar_url = req.body?.avatar_url || null;
-  if (!room_id || !name) return res.status(400).json({ error: "BAD_INPUT" });
-
-  // owner/dev only
-  const m = await ensureMember(room_id, req.user.id);
-  if (!m || roleRank(m.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  const [r] = await pool.execute(
-    "INSERT INTO bots(room_id,name,avatar_url,enabled,created_by) VALUES (?,?,?,?,?)",
-    [room_id, name, avatar_url, 1, req.user.id]
-  );
-  res.json({ ok: true, bot_id: r.insertId });
+  try {
+    const { room_id, name, avatar_url, settings_json } = req.body;
+    
+    if (!room_id || !name) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Check if user can create bots in this room
+    const canModerate = await canModerateRoom(room_id, req.user.id);
+    if (!canModerate) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO bots (room_id, name, avatar_url, created_by, settings_json)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        room_id,
+        name,
+        avatar_url || "",
+        req.user.id,
+        JSON.stringify(settings_json || {})
+      ]
+    );
+    
+    const botId = result.insertId;
+    
+    res.json({
+      ok: true,
+      bot_id: botId,
+      message: "Bot created successfully"
+    });
+    
+  } catch (error) {
+    console.error("Create bot error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
 app.post("/api/bots/:id/commands", authMiddleware, async (req, res) => {
-  const bot_id = Number(req.params.id);
-  const trigger_text = String(req.body?.trigger_text || "").trim();
-  const response_text = String(req.body?.response_text || "").trim();
-  const match_mode = req.body?.match_mode || "exact";
-  if (!bot_id || !trigger_text || !response_text) return res.status(400).json({ error: "BAD_INPUT" });
-
-  // check bot room permission
-  const bot = await dbOne("SELECT room_id FROM bots WHERE id=? LIMIT 1", [bot_id]);
-  if (!bot) return res.status(404).json({ error: "BOT_NOT_FOUND" });
-
-  const m = await ensureMember(bot.room_id, req.user.id);
-  if (!m || roleRank(m.role) < 2) return res.status(403).json({ error: "NO_PERMISSION" });
-
-  const [r] = await pool.execute(
-    "INSERT INTO bot_commands(bot_id,trigger_text,response_text,match_mode,enabled) VALUES (?,?,?,?,1)",
-    [bot_id, trigger_text, response_text, ["exact","starts_with","contains"].includes(match_mode) ? match_mode : "exact"]
-  );
-  res.json({ ok: true, command_id: r.insertId });
+  try {
+    const botId = mustInt(req.params.id);
+    const { trigger_text, response_text, match_type } = req.body;
+    
+    if (!trigger_text || !response_text) {
+      return res.status(400).json({ error: "INVALID_PARAMETERS" });
+    }
+    
+    // Get bot
+    const bot = await dbOne("SELECT * FROM bots WHERE id = ?", [botId]);
+    if (!bot) {
+      return res.status(404).json({ error: "BOT_NOT_FOUND" });
+    }
+    
+    // Check if user can manage this bot
+    const canModerate = await canModerateRoom(bot.room_id, req.user.id);
+    const isCreator = bot.created_by === req.user.id;
+    
+    if (!canModerate && !isCreator) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO bot_commands (bot_id, trigger_text, response_text, match_type)
+       VALUES (?, ?, ?, ?)`,
+      [
+        botId,
+        trigger_text,
+        response_text,
+        match_type || "exact"
+      ]
+    );
+    
+    res.json({
+      ok: true,
+      command_id: result.insertId,
+      message: "Bot command added successfully"
+    });
+    
+  } catch (error) {
+    console.error("Add bot command error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
-/* ================== WEBSOCKET ================== */
+// ===== Admin Routes =====
+app.get("/api/admin/users", authMiddleware, async (req, res) => {
+  try {
+    // Only developers can access this
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    const users = await dbAll(`
+      SELECT id, username, email, is_developer, verified, points, banned, created_at, last_seen
+      FROM users
+      ORDER BY created_at DESC
+      LIMIT 100
+    `);
+    
+    res.json({
+      ok: true,
+      users
+    });
+    
+  } catch (error) {
+    console.error("Get users error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/admin/users/:id/toggle-ban", authMiddleware, async (req, res) => {
+  try {
+    const userId = mustInt(req.params.id);
+    
+    // Only developers can ban users
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    // Cannot ban yourself
+    if (userId === req.user.id) {
+      return res.status(400).json({ error: "CANNOT_BAN_SELF" });
+    }
+    
+    const user = await dbOne("SELECT banned FROM users WHERE id = ?", [userId]);
+    if (!user) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+    
+    // Toggle ban status
+    const newBanStatus = !user.banned;
+    
+    await pool.execute(
+      "UPDATE users SET banned = ? WHERE id = ?",
+      [newBanStatus, userId]
+    );
+    
+    res.json({
+      ok: true,
+      banned: newBanStatus,
+      message: `User ${newBanStatus ? 'banned' : 'unbanned'} successfully`
+    });
+    
+  } catch (error) {
+    console.error("Toggle ban error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.post("/api/admin/users/:id/toggle-verify", authMiddleware, async (req, res) => {
+  try {
+    const userId = mustInt(req.params.id);
+    
+    // Only developers can verify users
+    if (!req.user.is_developer) {
+      return res.status(403).json({ error: "PERMISSION_DENIED" });
+    }
+    
+    const user = await dbOne("SELECT verified FROM users WHERE id = ?", [userId]);
+    if (!user) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+    
+    // Toggle verify status
+    const newVerifyStatus = !user.verified;
+    
+    await pool.execute(
+      "UPDATE users SET verified = ? WHERE id = ?",
+      [newVerifyStatus, userId]
+    );
+    
+    res.json({
+      ok: true,
+      verified: newVerifyStatus,
+      message: `User ${newVerifyStatus ? 'verified' : 'unverified'} successfully`
+    });
+    
+  } catch (error) {
+    console.error("Toggle verify error:", error);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+// ================== WEBSOCKET SERVER ==================
 const wss = new WebSocket.Server({ server });
 
-const WS_STATE = new Map();     // ws -> { userId, username, rooms:Set, lastPong, rate:{ts,count} }
-const ROOM_SOCKETS = new Map(); // roomId -> Set<ws>
+// Store connected clients
+const clients = new Map(); // userId -> { ws, rooms: Set<roomId> }
+const roomClients = new Map(); // roomId -> Set<ws>
 
-function roomSet(roomId) {
-  if (!ROOM_SOCKETS.has(roomId)) ROOM_SOCKETS.set(roomId, new Set());
-  return ROOM_SOCKETS.get(roomId);
-}
-function wsSend(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-}
-function broadcastRoom(roomId, obj) {
-  const set = ROOM_SOCKETS.get(roomId);
-  if (!set) return;
-  const msg = JSON.stringify(obj);
-  for (const ws of set) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-}
-
-async function broadcastMembersSnapshot(roomId) {
-  const [members] = await pool.execute(
-    `SELECT rm.user_id, rm.role, rm.muted_until, rm.restricted, rm.banned,
-            u.username, u.verified, u.frame_id,
-            rl.label_text, rl.label_color
-     FROM room_members rm
-     JOIN users u ON u.id=rm.user_id
-     LEFT JOIN room_labels rl ON rl.room_id=rm.room_id AND rl.user_id=rm.user_id
-     WHERE rm.room_id=? AND rm.banned=0
-     ORDER BY FIELD(rm.role,'owner','developer','member'), rm.joined_at ASC`,
-    [roomId]
-  );
-
-  const online = new Set();
-  for (const [ws, st] of WS_STATE.entries()) {
-    if (st.rooms?.has(roomId)) online.add(st.userId);
-  }
-
-  broadcastRoom(roomId, {
-    type: "members_snapshot",
-    room_id: roomId,
-    members: members.map((m) => ({
-      user_id: m.user_id,
-      username: m.username,
-      role: m.role,
-      muted_until: m.muted_until,
-      restricted: !!m.restricted,
-      label_text: m.label_text || null,
-      label_color: m.label_color || null,
-      verified: !!m.verified,
-      frame_id: m.frame_id ?? null,
-      online: online.has(m.user_id),
-    })),
+// Helper functions
+function broadcastToRoom(roomId, message, excludeUserId = null) {
+  const clientsInRoom = roomClients.get(roomId);
+  if (!clientsInRoom) return;
+  
+  const messageStr = JSON.stringify(message);
+  
+  clientsInRoom.forEach(client => {
+    const clientData = Array.from(clients.values()).find(c => c.ws === client);
+    if (clientData && clientData.userId !== excludeUserId && client.readyState === WebSocket.OPEN) {
+      client.send(messageStr);
+    }
   });
 }
 
-async function broadcastSeats(roomId) {
-  const [s] = await pool.execute(
-    "SELECT seat_index, user_id, seat_locked, seat_muted FROM room_seats WHERE room_id=? ORDER BY seat_index ASC",
-    [roomId]
-  );
-  broadcastRoom(roomId, { type: "seats_snapshot", room_id: roomId, seats: s });
+function sendToUser(userId, message) {
+  const clientData = clients.get(userId);
+  if (clientData && clientData.ws.readyState === WebSocket.OPEN) {
+    clientData.ws.send(JSON.stringify(message));
+  }
 }
 
-async function enforceAutoDelete(roomId) {
-  const settings = await dbOne("SELECT auto_delete_limit FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
-  const limit = mustInt(settings?.auto_delete_limit, 0);
-  if (!limit || limit <= 0) return;
-
-  const row = await dbOne("SELECT COUNT(*) AS c FROM messages WHERE room_id=? AND deleted=0", [roomId]);
-  const count = mustInt(row?.c, 0);
-  if (count <= limit) return;
-
-  const overflow = count - limit;
-
-  await pool.execute(
-    `UPDATE messages SET deleted=1, deleted_at=NOW()
-     WHERE room_id=? AND deleted=0
-     ORDER BY id ASC
-     LIMIT ?`,
-    [roomId, overflow]
-  );
-
-  broadcastRoom(roomId, { type: "system", room_id: roomId, text: "تم حذف الرسائل لتوفير مساحة للدردشة" });
-}
-
-async function requireWsAuth(ws) {
-  const st = WS_STATE.get(ws);
-  if (!st?.userId) return null;
-  const u = await dbOne("SELECT id, username, banned, is_developer FROM users WHERE id=? LIMIT 1", [st.userId]);
-  if (!u || u.banned) return null;
-  return u;
-}
-
-function normalizeType(t) {
-  // allow "seat.join" -> "seat_join"
-  const s = String(t || "");
-  return s.includes(".") ? s.replace(/\./g, "_") : s;
-}
-
-function rateLimitOK(st) {
-  const now = Date.now();
-  if (!st.rate) st.rate = { ts: now, count: 0 };
-  if (now - st.rate.ts > 2000) { st.rate.ts = now; st.rate.count = 0; }
-  st.rate.count++;
-  // allow ~10 actions per 2 sec
-  return st.rate.count <= 10;
-}
-
+// WebSocket connection handler
 wss.on("connection", (ws) => {
-  WS_STATE.set(ws, { userId: null, username: null, rooms: new Set(), lastPong: Date.now(), rate: { ts: Date.now(), count: 0 } });
-
-  wsSend(ws, { type: "hello", server_time: Date.now() });
-
-  ws.on("message", async (raw) => {
-    const msg = safeJsonParse(raw);
-    if (!msg || !msg.type) return;
-
-    const st = WS_STATE.get(ws);
-    if (!rateLimitOK(st)) return wsSend(ws, { type: "error", error: "RATE_LIMIT" });
-
-    const type = normalizeType(msg.type);
-
-    // heartbeat
-    if (type === "ping") {
-      st.lastPong = Date.now();
-      return wsSend(ws, { type: "pong" });
-    }
-
-    // AUTH
-    if (type === "auth") {
-      try {
-        const token = String(msg.token || "");
-        const payload = jwt.verify(token, JWT_SECRET);
-        const u = await dbOne("SELECT id, username, banned, is_developer FROM users WHERE id=? LIMIT 1", [payload.id]);
-        if (!u || u.banned) {
-          wsSend(ws, { type: "auth", ok: false, error: "BANNED_OR_NOUSER" });
-          return ws.close();
-        }
-        st.userId = u.id;
-        st.username = u.username;
-        wsSend(ws, { type: "auth", ok: true, user: { id: u.id, username: u.username, is_developer: !!u.is_developer } });
-      } catch {
-        wsSend(ws, { type: "auth", ok: false, error: "BAD_TOKEN" });
-        return ws.close();
+  let userId = null;
+  let userData = null;
+  
+  ws.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      
+      switch (data.type) {
+        case "auth":
+          await handleAuth(ws, data);
+          break;
+        
+        case "join_room":
+          await handleJoinRoom(ws, data, userId);
+          break;
+        
+        case "leave_room":
+          await handleLeaveRoom(ws, data, userId);
+          break;
+        
+        case "chat":
+          await handleChat(ws, data, userId);
+          break;
+        
+        case "typing":
+          await handleTyping(ws, data, userId);
+          break;
+        
+        case "edit_message":
+          await handleEditMessage(ws, data, userId);
+          break;
+        
+        case "delete_message":
+          await handleDeleteMessage(ws, data, userId);
+          break;
+        
+        case "moderate":
+          await handleModerate(ws, data, userId);
+          break;
+        
+        case "set_label":
+          await handleSetLabel(ws, data, userId);
+          break;
+        
+        case "transfer_owner":
+          await handleTransferOwner(ws, data, userId);
+          break;
+        
+        case "seat_join":
+          await handleSeatJoin(ws, data, userId);
+          break;
+        
+        case "seat_leave":
+          await handleSeatLeave(ws, data, userId);
+          break;
+        
+        case "seat_kick":
+          await handleSeatKick(ws, data, userId);
+          break;
+        
+        case "seat_lock":
+        case "seat_unlock":
+          await handleSeatLock(ws, data, userId);
+          break;
+        
+        case "seat_mute":
+        case "seat_unmute":
+          await handleSeatMute(ws, data, userId);
+          break;
+        
+        case "webrtc_offer":
+        case "webrtc_answer":
+        case "webrtc_ice":
+          await handleWebRTCSignal(ws, data, userId);
+          break;
+        
+        case "ping":
+          ws.send(JSON.stringify({ type: "pong" }));
+          break;
       }
-      return;
+    } catch (error) {
+      console.error("WebSocket message error:", error);
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
     }
-
-    // after this require auth
-    const authedUser = await requireWsAuth(ws);
-    if (!authedUser) return wsSend(ws, { type: "error", error: "UNAUTHORIZED" });
-
-    // JOIN ROOM
-    if (type === "join_room") {
-      const roomId = mustInt(msg.room_id, 0);
-      const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
-      if (!room) return wsSend(ws, { type: "join_room", ok: false, error: "ROOM_NOT_FOUND" });
-
-      const existing = await ensureMember(roomId, authedUser.id);
-      if (existing && existing.banned) return wsSend(ws, { type: "join_room", ok: false, error: "ROOM_BANNED" });
-
-      if (!existing) {
-        const role = authedUser.is_developer ? "developer" : "member";
-        await pool.execute("INSERT INTO room_members (room_id,user_id,role) VALUES (?,?,?)", [roomId, authedUser.id, role]);
+  });
+  
+  ws.on("close", () => {
+    if (userId && clients.has(userId)) {
+      const clientData = clients.get(userId);
+      
+      // Leave all rooms
+      if (clientData.rooms) {
+        clientData.rooms.forEach(roomId => {
+          const roomSet = roomClients.get(roomId);
+          if (roomSet) {
+            roomSet.delete(ws);
+            if (roomSet.size === 0) {
+              roomClients.delete(roomId);
+            }
+          }
+        });
       }
-
-      roomSet(roomId).add(ws);
-      st.rooms.add(roomId);
-
-      wsSend(ws, { type: "join_room", ok: true, room_id: roomId });
-      broadcastRoom(roomId, { type: "system", room_id: roomId, text: `انضم ${st.username}` });
-
-      await broadcastMembersSnapshot(roomId);
-      if (room.type === "voice") await broadcastSeats(roomId);
+      
+      // Remove from voice seats
+      if (userData) {
+        pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE user_id = ?",
+          [userId]
+        ).catch(console.error);
+      }
+      
+      clients.delete(userId);
+      
+      // Notify rooms about user leaving
+      if (clientData.rooms) {
+        clientData.rooms.forEach(roomId => {
+          broadcastToRoom(roomId, {
+            type: "user_left",
+            user_id: userId,
+            username: userData?.username,
+            room_id: roomId
+          });
+        });
+      }
+    }
+  });
+  
+  // Handle authentication
+  async function handleAuth(ws, data) {
+    const token = data.token;
+    if (!token) {
+      ws.send(JSON.stringify({ type: "auth", ok: false, error: "NO_TOKEN" }));
       return;
     }
-
-    // LEAVE ROOM
-    if (type === "leave_room") {
-      const roomId = mustInt(msg.room_id, 0);
-      const set = ROOM_SOCKETS.get(roomId);
-      if (set) set.delete(ws);
-      st.rooms.delete(roomId);
-
-      wsSend(ws, { type: "leave_room", ok: true, room_id: roomId });
-      broadcastRoom(roomId, { type: "system", room_id: roomId, text: `غادر ${st.username}` });
-      await broadcastMembersSnapshot(roomId);
+    
+    const decoded = verifyToken(token);
+    if (!decoded) {
+      ws.send(JSON.stringify({ type: "auth", ok: false, error: "INVALID_TOKEN" }));
       return;
     }
-
-    // TYPING
-    if (type === "typing") {
-      const roomId = mustInt(msg.room_id, 0);
-      if (!st.rooms.has(roomId)) return;
-      broadcastRoom(roomId, { type: "typing", room_id: roomId, user_id: authedUser.id, username: st.username, on: !!msg.on });
+    
+    const user = await dbOne(
+      "SELECT id, username, email, is_developer, verified, points, banned FROM users WHERE id = ?",
+      [decoded.id]
+    );
+    
+    if (!user || user.banned) {
+      ws.send(JSON.stringify({ type: "auth", ok: false, error: "USER_NOT_FOUND_OR_BANNED" }));
       return;
     }
-
-    // CHAT SEND
-    if (type === "chat") {
-      const roomId = mustInt(msg.room_id, 0);
-      const text = String(msg.text || "").trim();
-      if (!text) return;
-
-      if (!st.rooms.has(roomId)) return wsSend(ws, { type: "chat", ok: false, error: "NOT_IN_ROOM" });
-
-      const { room, member } = await getRoomAndMember(roomId, authedUser.id);
-      if (!room || !member) return wsSend(ws, { type: "chat", ok: false, error: "NOT_MEMBER" });
-      if (member.banned) return wsSend(ws, { type: "chat", ok: false, error: "ROOM_BANNED" });
-
-      const settings = await dbOne("SELECT chat_disabled, chat_locked FROM room_settings WHERE room_id=? LIMIT 1", [roomId]);
-      const locked = (settings?.chat_locked || settings?.chat_disabled) ? 1 : 0;
-      if (locked && roleRank(member.role) < 2) return wsSend(ws, { type: "chat", ok: false, error: "CHAT_LOCKED" });
-
-      if (member.restricted) return wsSend(ws, { type: "chat", ok: false, error: "RESTRICTED" });
-      if (isMuted(member)) return wsSend(ws, { type: "chat", ok: false, error: "MUTED" });
-
-      const msgType = String(msg.type || "text").slice(0, 24);
-      const metadata = msg.metadata ? JSON.stringify(msg.metadata) : null;
-
-      const [r] = await pool.execute(
-        "INSERT INTO messages (room_id,user_id,text,type,metadata) VALUES (?,?,?,?,?)",
-        [roomId, authedUser.id, text, msgType, metadata]
+    
+    userId = user.id;
+    userData = user;
+    
+    clients.set(userId, {
+      ws,
+      rooms: new Set(),
+      userId: user.id,
+      username: user.username
+    });
+    
+    ws.send(JSON.stringify({
+      type: "auth",
+      ok: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        is_developer: user.is_developer,
+        verified: user.verified,
+        points: user.points
+      }
+    }));
+  }
+  
+  // Handle joining a room
+  async function handleJoinRoom(ws, data, userId) {
+    if (!userId) {
+      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "NOT_AUTHENTICATED" }));
+      return;
+    }
+    
+    const roomId = mustInt(data.room_id);
+    if (!roomId) {
+      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "INVALID_ROOM_ID" }));
+      return;
+    }
+    
+    // Check if room exists
+    const room = await dbOne("SELECT * FROM rooms WHERE id = ?", [roomId]);
+    if (!room) {
+      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "ROOM_NOT_FOUND" }));
+      return;
+    }
+    
+    // Check if user is banned from room
+    const isBanned = await dbOne(
+      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = TRUE",
+      [roomId, userId]
+    );
+    
+    if (isBanned) {
+      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "BANNED_FROM_ROOM" }));
+      return;
+    }
+    
+    // Check if room is full
+    const memberCount = await dbOne(
+      "SELECT COUNT(*) as count FROM room_members WHERE room_id = ? AND is_banned = FALSE",
+      [roomId]
+    );
+    
+    if (memberCount.count >= room.max_members) {
+      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "ROOM_FULL" }));
+      return;
+    }
+    
+    // Check if user has enough points to join (if room has price)
+    if (room.price_points > 0) {
+      const user = await dbOne("SELECT points FROM users WHERE id = ?", [userId]);
+      if (user.points < room.price_points) {
+        ws.send(JSON.stringify({ type: "join_room", ok: false, error: "INSUFFICIENT_POINTS" }));
+        return;
+      }
+      
+      // Deduct points
+      await pool.execute(
+        "UPDATE users SET points = points - ? WHERE id = ?",
+        [room.price_points, userId]
       );
-      const messageId = r.insertId;
+      
+      // Record transaction
+         await pool.execute(
+        "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
+          [userId, -room.price_points, `رسوم الانضمام للغرفة: ${room.name}`]
+         );
 
-      const lbl = await dbOne("SELECT label_text,label_color FROM room_labels WHERE room_id=? AND user_id=? LIMIT 1", [roomId, authedUser.id]);
 
-      broadcastRoom(roomId, {
-        type: "chat",
-        ok: true,
-        room_id: roomId,
-        message: {
-          id: messageId,
-          room_id: roomId,
-          user_id: authedUser.id,
-          username: st.username,
-          text,
-          type: msgType,
-          metadata: msg.metadata || null,
-          created_at: nowIso(),
-          edited_at: null,
-          deleted: 0,
-          label_text: lbl?.label_text || null,
-          label_color: lbl?.label_color || null,
-        },
-      });
+         // ... (استمرار من الجزء السابق)
 
-      // BOT SYSTEM: if any bot matches this text -> emit bot message
-      await maybeRunBots(roomId, text);
-
-      await enforceAutoDelete(roomId);
-      return;
-    }
-
-    // EDIT / DELETE messages
-    if (type === "edit_message" || type === "delete_message") {
-      const roomId = mustInt(msg.room_id, 0);
-      const messageId = Number(msg.message_id);
-      if (!roomId || !messageId) return;
-
-      const m = await dbOne("SELECT * FROM messages WHERE id=? AND room_id=? LIMIT 1", [messageId, roomId]);
-      if (!m || m.deleted) return wsSend(ws, { type, ok: false, error: "NOT_FOUND" });
-
-      const member = await ensureMember(roomId, authedUser.id);
-      if (!member) return wsSend(ws, { type, ok: false, error: "NOT_MEMBER" });
-
-      const can = (m.user_id === authedUser.id) || roleRank(member.role) >= 2;
-      if (!can) return wsSend(ws, { type, ok: false, error: "NO_PERMISSION" });
-
-      if (type === "edit_message") {
-        const newText = String(msg.text || "").trim();
-        if (!newText) return;
-        await pool.execute("UPDATE messages SET text=?, edited_at=NOW() WHERE id=?", [newText, messageId]);
-        broadcastRoom(roomId, { type: "message_updated", room_id: roomId, message_id: messageId, text: newText, edited_at: nowIso() });
-        wsSend(ws, { type: "edit_message", ok: true });
-      } else {
-        await pool.execute("UPDATE messages SET deleted=1, deleted_at=NOW() WHERE id=?", [messageId]);
-        broadcastRoom(roomId, { type: "message_deleted", room_id: roomId, message_id: messageId });
-        wsSend(ws, { type: "delete_message", ok: true });
-      }
-      return;
-    }
-
-    // MODERATION (WS)
-    if (type === "moderate") {
-      const roomId = mustInt(msg.room_id, 0);
-      const action = String(msg.action || "");
-      const targetUserId = mustInt(msg.target_user_id, 0);
-      const minutes = mustInt(msg.minutes, 0);
-      if (!roomId || !action) return;
-
-      const canMod = await ensureCanModerate(roomId, authedUser.id);
-      if (!canMod) return wsSend(ws, { type: "moderate", ok: false, error: "NO_PERMISSION" });
-
-      if (["mute", "ban", "unban", "restrict", "unrestrict", "kick"].includes(action) && !targetUserId) {
-        return wsSend(ws, { type: "moderate", ok: false, error: "NO_TARGET" });
-      }
-
-      if (action === "mute") {
-        const until = new Date(Date.now() + Math.max(1, minutes) * 60_000);
-        await pool.execute(
-          "UPDATE room_members SET muted_until=? WHERE room_id=? AND user_id=?",
-          [until.toISOString().slice(0, 19).replace("T", " "), roomId, targetUserId]
+        // Add user to room members if not already a member
+        const existingMember = await dbOne(
+          "SELECT id FROM room_members WHERE room_id = ? AND user_id = ?",
+          [roomId, userId]
         );
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم كتم المستخدم (${targetUserId})` });
-      }
 
-      if (action === "ban") {
-        await pool.execute("UPDATE room_members SET banned=1 WHERE room_id=? AND user_id=?", [roomId, targetUserId]);
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم حظر المستخدم (${targetUserId})` });
-      }
+        if (!existingMember) {
+          await pool.execute(
+            "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'member')",
+            [roomId, userId]
+          );
 
-      if (action === "unban") {
-        await pool.execute("UPDATE room_members SET banned=0 WHERE room_id=? AND user_id=?", [roomId, targetUserId]);
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم رفع الحظر عن المستخدم (${targetUserId})` });
-      }
+          // Add system message
+          await pool.execute(
+            "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+            [roomId, `${userData.username} انضم للغرفة`]
+          );
+        }
 
-      if (action === "restrict") {
-        await pool.execute("UPDATE room_members SET restricted=1 WHERE room_id=? AND user_id=?", [roomId, targetUserId]);
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم تقييد الدردشة للمستخدم (${targetUserId})` });
-      }
+        // Add to WebSocket room tracking
+        const clientData = clients.get(userId);
+        if (clientData) {
+          clientData.rooms.add(roomId);
+        }
 
-      if (action === "unrestrict") {
-        await pool.execute("UPDATE room_members SET restricted=0 WHERE room_id=? AND user_id=?", [roomId, targetUserId]);
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم فك التقييد عن المستخدم (${targetUserId})` });
-      }
+        if (!roomClients.has(roomId)) {
+          roomClients.set(roomId, new Set());
+        }
+        roomClients.get(roomId).add(ws);
 
-      if (action === "kick") {
-        const set = ROOM_SOCKETS.get(roomId);
-        if (set) {
-          for (const sock of set) {
-            const sst = WS_STATE.get(sock);
-            if (sst?.userId === targetUserId) {
-              sst.rooms.delete(roomId);
-              set.delete(sock);
-              wsSend(sock, { type: "kicked", room_id: roomId });
+        // Get room members
+        const members = await dbAll(`
+          SELECT rm.*, 
+                 u.username, 
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified,
+                 u.points
+          FROM room_members rm
+          LEFT JOIN users u ON rm.user_id = u.id
+          WHERE rm.room_id = ? AND rm.is_banned = FALSE
+        `, [roomId]);
+
+        // Get messages
+        const messages = await dbAll(`
+          SELECT m.*, 
+                 u.username,
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified
+          FROM messages m
+          LEFT JOIN users u ON m.user_id = u.id
+          WHERE m.room_id = ? AND m.deleted = FALSE
+          ORDER BY m.id DESC
+          LIMIT 100
+        `, [roomId]);
+
+        // Get voice seats if voice room
+        let seats = [];
+        if (room.type === "voice") {
+          seats = await dbAll(
+            "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+            [roomId]
+          );
+        }
+
+        ws.send(JSON.stringify({
+          type: "join_room",
+          ok: true,
+          room: {
+            ...room,
+            members: members.map(m => ({
+              user_id: m.user_id,
+              username: m.username,
+              avatar_url: m.avatar_url,
+              role: m.role,
+              muted_until: m.muted_until,
+              label_text: m.label_text,
+              label_color: m.label_color,
+              is_developer: m.is_developer,
+              verified: m.verified,
+              points: m.points
+            }))
+          },
+          messages: messages.reverse(),
+          seats
+        }));
+
+        // Notify others
+        broadcastToRoom(roomId, {
+          type: "user_joined",
+          user: {
+            id: userId,
+            username: userData.username,
+            avatar_url: userData.avatar_url,
+            is_developer: userData.is_developer,
+            verified: userData.verified
+          }
+        }, userId);
+      }
+      
+      async function handleLeaveRoom(ws, data, userId) {
+        if (!userId) {
+          ws.send(JSON.stringify({ type: "error", error: "NOT_AUTHENTICATED" }));
+          return;
+        }
+        
+        const roomId = mustInt(data.room_id);
+        if (!roomId) return;
+        
+        const clientData = clients.get(userId);
+        if (clientData) {
+          clientData.rooms.delete(roomId);
+        }
+        
+        const roomSet = roomClients.get(roomId);
+        if (roomSet) {
+          roomSet.delete(ws);
+          if (roomSet.size === 0) {
+            roomClients.delete(roomId);
+          }
+        }
+        
+        // Remove from voice seat
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, userId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "user_left",
+          user_id: userId,
+          username: userData?.username
+        });
+        
+        ws.send(JSON.stringify({
+          type: "leave_room",
+          ok: true,
+          room_id: roomId
+        }));
+      }
+      
+      async function handleChat(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, text, message_type, metadata } = data;
+        const roomId = mustInt(room_id);
+        
+        if (!roomId || !text || text.trim().length === 0) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
+          return;
+        }
+        
+        // Check if user is member of room
+        const member = await dbOne(
+          "SELECT * FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+          [roomId, userId]
+        );
+        
+        if (!member) {
+          ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
+          return;
+        }
+        
+        // Check if user is muted
+        if (member.muted_until && new Date(member.muted_until) > new Date()) {
+          ws.send(JSON.stringify({ type: "error", error: "USER_MUTED" }));
+          return;
+        }
+        
+        // Check if chat is locked
+        const room = await dbOne(
+          "SELECT settings_json FROM rooms WHERE id = ?",
+          [roomId]
+        );
+        
+        if (room) {
+          const settings = safeJsonParse(room.settings_json) || {};
+          if (settings.chat_locked) {
+            // Check if user can bypass lock (moderator or owner)
+            const canModerate = await canModerateRoom(roomId, userId);
+            if (!canModerate) {
+              ws.send(JSON.stringify({ type: "error", error: "CHAT_LOCKED" }));
+              return;
             }
           }
         }
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم طرد المستخدم (${targetUserId})` });
-      }
-
-      if (action === "chat_lock" || action === "chat_unlock") {
-        const locked = action === "chat_lock" ? 1 : 0;
-        await pool.execute("UPDATE room_settings SET chat_locked=? WHERE room_id=?", [locked, roomId]);
-        broadcastRoom(roomId, { type: locked ? "chat_locked" : "chat_unlocked", room_id: roomId });
-      }
-
-      if (action === "autodelete_set") {
-        const limit = Math.max(0, Math.min(500, mustInt(msg.limit, 0)));
-        await pool.execute("UPDATE room_settings SET auto_delete_limit=? WHERE room_id=?", [limit, roomId]);
-        broadcastRoom(roomId, { type: "system", room_id: roomId, text: `تم تحديث حد الحذف التلقائي إلى ${limit}` });
-      }
-
-      await broadcastMembersSnapshot(roomId);
-      wsSend(ws, { type: "moderate", ok: true });
-      return;
-    }
-
-    // SET LABEL
-    if (type === "set_label") {
-      const roomId = mustInt(msg.room_id, 0);
-      const targetUserId = mustInt(msg.target_user_id, 0);
-      const labelText = String(msg.label_text || "").trim();
-      const labelColor = String(msg.label_color || "#ff3b30").trim();
-      if (!roomId || !targetUserId || !labelText) return;
-
-      const canMod = await ensureCanModerate(roomId, authedUser.id);
-      if (!canMod) return wsSend(ws, { type: "set_label", ok: false, error: "NO_PERMISSION" });
-
-      await pool.execute(
-        `INSERT INTO room_labels (room_id, user_id, label_text, label_color)
-         VALUES (?,?,?,?)
-         ON DUPLICATE KEY UPDATE label_text=VALUES(label_text), label_color=VALUES(label_color)`,
-        [roomId, targetUserId, labelText.slice(0, 40), labelColor.slice(0, 20)]
-      );
-
-      await broadcastMembersSnapshot(roomId);
-      wsSend(ws, { type: "set_label", ok: true });
-      return;
-    }
-
-    // TRANSFER OWNERSHIP
-    if (type === "transfer_owner") {
-      const roomId = mustInt(msg.room_id, 0);
-      const newOwnerId = mustInt(msg.new_owner_id, 0);
-      if (!roomId || !newOwnerId) return;
-
-      const canOwner = await ensureCanOwner(roomId, authedUser.id);
-      if (!canOwner) return wsSend(ws, { type: "transfer_owner", ok: false, error: "OWNER_ONLY" });
-
-      // ensure new owner is member
-      const target = await ensureMember(roomId, newOwnerId);
-      if (!target) return wsSend(ws, { type: "transfer_owner", ok: false, error: "TARGET_NOT_MEMBER" });
-
-      await pool.execute("UPDATE rooms SET owner_user_id=? WHERE id=?", [newOwnerId, roomId]);
-      await pool.execute("UPDATE room_members SET role='member' WHERE room_id=? AND user_id=?", [roomId, authedUser.id]);
-      await pool.execute("UPDATE room_members SET role='owner' WHERE room_id=? AND user_id=?", [roomId, newOwnerId]);
-
-      broadcastRoom(roomId, { type: "owner_transfer", room_id: roomId, old_owner_id: authedUser.id, new_owner_id: newOwnerId });
-      await broadcastMembersSnapshot(roomId);
-
-      wsSend(ws, { type: "transfer_owner", ok: true });
-      return;
-    }
-
-    // ===== Seats & WebRTC signaling =====
-    if (type === "seat_join" || type === "seat_take") {
-      const roomId = mustInt(msg.room_id, 0);
-      const seatIndex = mustInt(msg.seat_index, 0);
-      if (!roomId || !seatIndex) return;
-
-      const room = await dbOne("SELECT * FROM rooms WHERE id=? LIMIT 1", [roomId]);
-      if (!room || room.type !== "voice") return;
-
-      // must be in room
-      if (!st.rooms.has(roomId)) return wsSend(ws, { type, ok: false, error: "NOT_IN_ROOM" });
-
-      // voice ban check
-      const vb = await dbOne("SELECT banned FROM room_voice_bans WHERE room_id=? AND user_id=? LIMIT 1", [roomId, authedUser.id]);
-      if (vb?.banned) return wsSend(ws, { type, ok: false, error: "VOICE_BANNED" });
-
-      const seat = await dbOne("SELECT * FROM room_seats WHERE room_id=? AND seat_index=? LIMIT 1", [roomId, seatIndex]);
-      if (!seat) return wsSend(ws, { type, ok: false, error: "SEAT_NOT_FOUND" });
-      if (seat.seat_locked) return wsSend(ws, { type, ok: false, error: "SEAT_LOCKED" });
-      if (seat.user_id && seat.user_id !== authedUser.id) return wsSend(ws, { type, ok: false, error: "SEAT_TAKEN" });
-
-      // leave other seat if sitting
-      await pool.execute("UPDATE room_seats SET user_id=NULL, seat_muted=0 WHERE room_id=? AND user_id=?", [roomId, authedUser.id]);
-
-      await pool.execute("UPDATE room_seats SET user_id=? WHERE room_id=? AND seat_index=?", [authedUser.id, roomId, seatIndex]);
-      await broadcastSeats(roomId);
-
-      wsSend(ws, { type: "seat_join_approved", room_id: roomId, seat_index: seatIndex });
-      return;
-    }
-
-    if (type === "seat_leave") {
-      const roomId = mustInt(msg.room_id, 0);
-      if (!roomId) return;
-      await pool.execute("UPDATE room_seats SET user_id=NULL, seat_muted=0 WHERE room_id=? AND user_id=?", [roomId, authedUser.id]);
-      await broadcastSeats(roomId);
-      return;
-    }
-
-    if (type === "seat_kick") {
-      const roomId = mustInt(msg.room_id, 0);
-      const targetUserId = mustInt(msg.target_user_id, 0);
-      if (!roomId || !targetUserId) return;
-
-      const canMod = await ensureCanModerate(roomId, authedUser.id);
-      if (!canMod) return wsSend(ws, { type, ok: false, error: "NO_PERMISSION" });
-
-      await pool.execute("UPDATE room_seats SET user_id=NULL, seat_muted=0 WHERE room_id=? AND user_id=?", [roomId, targetUserId]);
-      await broadcastSeats(roomId);
-      broadcastRoom(roomId, { type: "seat_kick", room_id: roomId, target_user_id: targetUserId });
-      return;
-    }
-
-    if (type === "seat_lock" || type === "seat_unlock") {
-      const roomId = mustInt(msg.room_id, 0);
-      const seatIndex = mustInt(msg.seat_index, 0);
-      const locked = type === "seat_lock" ? 1 : 0;
-      if (!roomId || !seatIndex) return;
-
-      const canMod = await ensureCanModerate(roomId, authedUser.id);
-      if (!canMod) return wsSend(ws, { type, ok: false, error: "NO_PERMISSION" });
-
-      await pool.execute("UPDATE room_seats SET seat_locked=? WHERE room_id=? AND seat_index=?", [locked, roomId, seatIndex]);
-      await broadcastSeats(roomId);
-      broadcastRoom(roomId, { type: locked ? "seat_lock" : "seat_unlock", room_id: roomId, seat_index: seatIndex });
-      return;
-    }
-
-    if (type === "seat_mute" || type === "seat_unmute") {
-      const roomId = mustInt(msg.room_id, 0);
-      const seatIndex = mustInt(msg.seat_index, 0);
-      const muted = type === "seat_mute" ? 1 : 0;
-      if (!roomId || !seatIndex) return;
-
-      const canMod = await ensureCanModerate(roomId, authedUser.id);
-      if (!canMod) return wsSend(ws, { type, ok: false, error: "NO_PERMISSION" });
-
-      await pool.execute("UPDATE room_seats SET seat_muted=? WHERE room_id=? AND seat_index=?", [muted, roomId, seatIndex]);
-      await broadcastSeats(roomId);
-      broadcastRoom(roomId, { type: muted ? "seat_mute" : "seat_unmute", room_id: roomId, seat_index: seatIndex });
-      return;
-    }
-
-    // accept dotted webrtc.* too
-    if (type === "webrtc_offer" || type === "webrtc_answer" || type === "webrtc_ice") {
-      const roomId = mustInt(msg.room_id, 0);
-      const toUserId = mustInt(msg.to_user_id, 0);
-      if (!roomId || !toUserId) return;
-
-      // must be in room
-      if (!st.rooms.has(roomId)) return;
-
-      // forward to that user if online in same room
-      const set = ROOM_SOCKETS.get(roomId);
-      if (!set) return;
-      for (const sock of set) {
-        const sst = WS_STATE.get(sock);
-        if (sst?.userId === toUserId) {
-          wsSend(sock, {
-            type, // already normalized
-            room_id: roomId,
-            from_user_id: authedUser.id,
-            sdp: msg.sdp,
-            candidate: msg.candidate,
-            seat_index: msg.seat_index ?? null,
+        
+        // Process bot commands
+        const bots = await dbAll(`
+          SELECT b.*, c.trigger_text, c.response_text, c.match_type
+          FROM bots b
+          LEFT JOIN bot_commands c ON b.id = c.bot_id
+          WHERE b.room_id = ? AND b.enabled = TRUE AND c.enabled = TRUE
+        `, [roomId]);
+        
+        let botResponse = null;
+        for (const bot of bots) {
+          if (!bot.trigger_text || !bot.response_text) continue;
+          
+          let shouldRespond = false;
+          const messageText = text.trim().toLowerCase();
+          const triggerText = bot.trigger_text.toLowerCase();
+          
+          switch (bot.match_type) {
+            case "exact":
+              shouldRespond = messageText === triggerText;
+              break;
+            case "starts_with":
+              shouldRespond = messageText.startsWith(triggerText);
+              break;
+            case "contains":
+              shouldRespond = messageText.includes(triggerText);
+              break;
+          }
+          
+          if (shouldRespond) {
+            botResponse = {
+              bot_id: bot.id,
+              bot_name: bot.name,
+              avatar_url: bot.avatar_url,
+              response: bot.response_text
+            };
+            break;
+          }
+        }
+        
+        // Insert message
+        const [result] = await pool.execute(
+          `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            roomId,
+            userId,
+            text.trim(),
+            message_type || "text",
+            JSON.stringify(metadata || {})
+          ]
+        );
+        
+        const messageId = result.insertId;
+        
+        // Get message with user info
+        const message = await dbOne(`
+          SELECT m.*, 
+                 u.username,
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified,
+                 rm.label_text,
+                 rm.label_color
+          FROM messages m
+          LEFT JOIN users u ON m.user_id = u.id
+          LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+          WHERE m.id = ?
+        `, [messageId]);
+        
+        // Broadcast message
+        broadcastToRoom(roomId, {
+          type: "chat",
+          message
+        });
+        
+        // Send bot response if any
+        if (botResponse) {
+          // Insert bot message
+          const [botResult] = await pool.execute(
+            `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
+             VALUES (?, 0, ?, 'bot', ?)`,
+            [
+              roomId,
+              botResponse.response,
+              JSON.stringify({
+                bot_id: botResponse.bot_id,
+                bot_name: botResponse.bot_name,
+                avatar_url: botResponse.avatar_url
+              })
+            ]
+          );
+          
+          const botMessageId = botResult.insertId;
+          const botMessage = await dbOne(
+            "SELECT * FROM messages WHERE id = ?",
+            [botMessageId]
+          );
+          
+          broadcastToRoom(roomId, {
+            type: "chat",
+            message: {
+              ...botMessage,
+              username: botResponse.bot_name,
+              avatar_url: botResponse.avatar_url,
+              is_developer: false,
+              verified: false
+            }
           });
         }
+        
+        // Auto-delete old messages if limit is set
+        if (room) {
+          const settings = safeJsonParse(room.settings_json) || {};
+          if (settings.auto_delete_limit > 0) {
+            await cleanupOldMessages(roomId, settings.auto_delete_limit);
+          }
+        }
       }
-      return;
-    }
-  });
-
-  ws.on("close", async () => {
-    const st = WS_STATE.get(ws);
-    if (st?.rooms) {
-      for (const roomId of st.rooms) {
-        const set = ROOM_SOCKETS.get(roomId);
-        if (set) set.delete(ws);
-        // leave seat if sitting
-        await pool.execute("UPDATE room_seats SET user_id=NULL, seat_muted=0 WHERE room_id=? AND user_id=?", [roomId, st.userId]);
-        await broadcastMembersSnapshot(roomId);
-        await broadcastSeats(roomId);
+      
+      async function handleTyping(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, is_typing } = data;
+        const roomId = mustInt(room_id);
+        
+        broadcastToRoom(roomId, {
+          type: "typing",
+          user_id: userId,
+          username: userData?.username,
+          is_typing: !!is_typing
+        }, userId);
       }
-    }
-    WS_STATE.delete(ws);
+      
+      async function handleEditMessage(ws, data, userId) {
+        if (!userId) return;
+        
+        const { message_id, text } = data;
+        const messageId = mustInt(message_id);
+        
+        if (!messageId || !text || text.trim().length === 0) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Get message
+        const message = await dbOne(
+          "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
+          [messageId]
+        );
+        
+        if (!message) {
+          ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
+          return;
+        }
+        
+        // Check permissions
+        const isOwner = message.user_id === userId;
+        const canModerate = await canModerateRoom(message.room_id, userId);
+        
+        if (!isOwner && !canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Update message
+        await pool.execute(
+          "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
+          [text.trim(), nowIso(), messageId]
+        );
+        
+        // Get updated message
+        const updatedMessage = await dbOne(`
+          SELECT m.*, 
+                 u.username,
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified,
+                 rm.label_text,
+                 rm.label_color
+          FROM messages m
+          LEFT JOIN users u ON m.user_id = u.id
+          LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+          WHERE m.id = ?
+        `, [messageId]);
+        
+        broadcastToRoom(message.room_id, {
+          type: "edit_message",
+          message: updatedMessage
+        });
+      }
+      
+      async function handleDeleteMessage(ws, data, userId) {
+        if (!userId) return;
+        
+        const { message_id, reason } = data;
+        const messageId = mustInt(message_id);
+        
+        if (!messageId) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE_ID" }));
+          return;
+        }
+        
+        // Get message
+        const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
+        
+        if (!message) {
+          ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
+          return;
+        }
+        
+        // Check permissions
+        const isOwner = message.user_id === userId;
+        const canModerate = await canModerateRoom(message.room_id, userId);
+        
+        if (!isOwner && !canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Delete message
+        await pool.execute(
+          "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
+          [userId, nowIso(), messageId]
+        );
+        
+        broadcastToRoom(message.room_id, {
+          type: "delete_message",
+          message_id: messageId,
+          deleted_by: userId,
+          reason: reason || ""
+        });
+      }
+      
+      async function handleModerate(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, action, target_user_id, duration, reason } = data;
+        const roomId = mustInt(room_id);
+        const targetUserId = mustInt(target_user_id);
+        
+        if (!roomId || !action || !targetUserId) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check permissions
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Cannot moderate yourself
+        if (targetUserId === userId) {
+          ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_SELF" }));
+          return;
+        }
+        
+        // Check target user's role
+        const targetMember = await getRoomMember(roomId, targetUserId);
+        if (!targetMember) {
+          ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
+          return;
+        }
+        
+        // Cannot moderate users with same or higher rank
+        const userMember = await getRoomMember(roomId, userId);
+        const userRank = roleRank(userMember?.role);
+        const targetRank = roleRank(targetMember.role);
+        
+        if (targetRank >= userRank) {
+          ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_HIGHER_RANK" }));
+          return;
+        }
+        
+        let message = "";
+        
+        switch (action) {
+          case "mute":
+            const muteMinutes = mustInt(duration, 5);
+            const muteUntil = new Date(Date.now() + muteMinutes * 60000);
+            
+            await pool.execute(
+              "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
+              [muteUntil, roomId, targetUserId]
+            );
+            
+            message = `تم كتم ${targetMember.username} لمدة ${muteMinutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`;
+            break;
+            
+          case "unmute":
+            await pool.execute(
+              "UPDATE room_members SET muted_until = NULL WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            message = `تم إلغاء كتم ${targetMember.username}`;
+            break;
+            
+          case "ban":
+            await pool.execute(
+              "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            // Remove from voice seats
+            await pool.execute(
+              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            // Disconnect user from room
+            const targetClient = clients.get(targetUserId);
+            if (targetClient) {
+              targetClient.ws.send(JSON.stringify({
+                type: "banned",
+                room_id: roomId,
+                reason: reason || ""
+              }));
+              
+              // Remove from room tracking
+              targetClient.rooms.delete(roomId);
+            }
+            
+            message = `تم حظر ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
+            break;
+            
+          case "unban":
+            await pool.execute(
+              "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            message = `تم إلغاء حظر ${targetMember.username}`;
+            break;
+            
+          case "kick":
+            // Remove from voice seats
+            await pool.execute(
+              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            // Disconnect user from room
+            const targetClient2 = clients.get(targetUserId);
+            if (targetClient2) {
+              targetClient2.ws.send(JSON.stringify({
+                type: "kicked",
+                room_id: roomId,
+                reason: reason || ""
+              }));
+              
+              // Remove from room tracking
+              targetClient2.rooms.delete(roomId);
+            }
+            
+            message = `تم طرد ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
+            break;
+            
+          case "promote":
+            await pool.execute(
+              "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            message = `تم ترقية ${targetMember.username} إلى مشرف`;
+            break;
+            
+          case "demote":
+            await pool.execute(
+              "UPDATE room_members SET role = 'member' WHERE room_id = ? AND user_id = ?",
+              [roomId, targetUserId]
+            );
+            
+            message = `تم خفض رتبة ${targetMember.username} إلى عضو`;
+            break;
+        }
+        
+        // Add system message
+        if (message) {
+          await pool.execute(
+            "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+            [roomId, message]
+          );
+          
+          const systemMessage = await dbOne(`
+            SELECT * FROM messages 
+            WHERE room_id = ? 
+            ORDER BY id DESC 
+            LIMIT 1
+          `, [roomId]);
+          
+          broadcastToRoom(roomId, {
+            type: "chat",
+            message: systemMessage
+          });
+        }
+        
+        // Update member list
+        const members = await dbAll(`
+          SELECT rm.*, 
+                 u.username, 
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified
+          FROM room_members rm
+          LEFT JOIN users u ON rm.user_id = u.id
+          WHERE rm.room_id = ? AND rm.is_banned = FALSE
+        `, [roomId]);
+        
+        broadcastToRoom(roomId, {
+          type: "members_update",
+          members: members.map(m => ({
+            user_id: m.user_id,
+            username: m.username,
+            avatar_url: m.avatar_url,
+            role: m.role,
+            muted_until: m.muted_until,
+            label_text: m.label_text,
+            label_color: m.label_color,
+            is_developer: m.is_developer,
+            verified: m.verified
+          }))
+        });
+      }
+      
+      async function handleSetLabel(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, target_user_id, label_text, label_color } = data;
+        const roomId = mustInt(room_id);
+        const targetUserId = mustInt(target_user_id);
+        
+        if (!roomId || !targetUserId) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check permissions
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Update label
+        await pool.execute(
+          "UPDATE room_members SET label_text = ?, label_color = ? WHERE room_id = ? AND user_id = ?",
+          [label_text || null, label_color || "#007AFF", roomId, targetUserId]
+        );
+        
+        // Get updated member
+        const member = await dbOne(`
+          SELECT rm.*, 
+                 u.username, 
+                 u.avatar_url,
+                 u.is_developer,
+                 u.verified
+          FROM room_members rm
+          LEFT JOIN users u ON rm.user_id = u.id
+          WHERE rm.room_id = ? AND rm.user_id = ?
+        `, [roomId, targetUserId]);
+        
+        broadcastToRoom(roomId, {
+          type: "member_update",
+          member: {
+            user_id: member.user_id,
+            username: member.username,
+            avatar_url: member.avatar_url,
+            role: member.role,
+            muted_until: member.muted_until,
+            label_text: member.label_text,
+            label_color: member.label_color,
+            is_developer: member.is_developer,
+            verified: member.verified
+          }
+        });
+      }
+      
+      async function handleTransferOwner(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, new_owner_id } = data;
+        const roomId = mustInt(room_id);
+        const newOwnerId = mustInt(new_owner_id);
+        
+        if (!roomId || !newOwnerId) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check if user is room owner
+        const isOwner = await isRoomOwner(roomId, userId);
+        if (!isOwner) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Check if new owner is room member
+        const newOwnerMember = await getRoomMember(roomId, newOwnerId);
+        if (!newOwnerMember) {
+          ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
+          return;
+        }
+        
+        // Transfer ownership
+        await pool.execute(
+          "UPDATE rooms SET owner_id = ? WHERE id = ?",
+          [newOwnerId, roomId]
+        );
+        
+        await pool.execute(
+          "UPDATE room_members SET role = 'owner' WHERE room_id = ? AND user_id = ?",
+          [roomId, newOwnerId]
+        );
+        
+        await pool.execute(
+          "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
+          [roomId, userId]
+        );
+        
+        // Add system message
+        await pool.execute(
+          "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+          [roomId, `تم نقل ملكية الغرفة إلى ${newOwnerMember.username}`]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "owner_transferred",
+          old_owner_id: userId,
+          new_owner_id: newOwnerId
+        });
+      }
+      
+      async function handleSeatJoin(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, seat_index } = data;
+        const roomId = mustInt(room_id);
+        const seatIndex = mustInt(seat_index);
+        
+        if (!roomId || !seatIndex) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check if user is room member
+        const isMember = await dbOne(
+          "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+          [roomId, userId]
+        );
+        
+        if (!isMember) {
+          ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
+          return;
+        }
+        
+        // Check if room is voice room
+        const room = await dbOne("SELECT type FROM rooms WHERE id = ?", [roomId]);
+        if (!room || room.type !== "voice") {
+          ws.send(JSON.stringify({ type: "error", error: "NOT_VOICE_ROOM" }));
+          return;
+        }
+        
+        // Check if seat exists and is available
+        const seat = await dbOne(
+          "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+          [roomId, seatIndex]
+        );
+        
+        if (!seat) {
+          ws.send(JSON.stringify({ type: "error", error: "SEAT_NOT_FOUND" }));
+          return;
+        }
+        
+        if (seat.user_id !== null && seat.user_id !== userId) {
+          ws.send(JSON.stringify({ type: "error", error: "SEAT_OCCUPIED" }));
+          return;
+        }
+        
+        if (seat.is_locked) {
+          ws.send(JSON.stringify({ type: "error", error: "SEAT_LOCKED" }));
+          return;
+        }
+        
+        // Remove user from any other seat
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, userId]
+        );
+        
+        // Occupy seat
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = ? WHERE room_id = ? AND seat_index = ?",
+          [userId, roomId, seatIndex]
+        );
+        
+        // Get updated seats
+        const seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "seats_update",
+          seats
+        });
+      }
+      
+      async function handleSeatLeave(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, seat_index } = data;
+        const roomId = mustInt(room_id);
+        const seatIndex = mustInt(seat_index);
+        
+        if (!roomId) return;
+        
+        if (seatIndex) {
+          // Leave specific seat
+          await pool.execute(
+            "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ? AND user_id = ?",
+            [roomId, seatIndex, userId]
+          );
+        } else {
+          // Leave all seats
+          await pool.execute(
+            "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+            [roomId, userId]
+          );
+        }
+        
+        // Get updated seats
+        const seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "seats_update",
+          seats
+        });
+      }
+      
+      async function handleSeatKick(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, seat_index } = data;
+        const roomId = mustInt(room_id);
+        const seatIndex = mustInt(seat_index);
+        
+        if (!roomId || !seatIndex) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check permissions
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        // Get seat
+        const seat = await dbOne(
+          "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+          [roomId, seatIndex]
+        );
+        
+        if (!seat || !seat.user_id) {
+          ws.send(JSON.stringify({ type: "error", error: "SEAT_EMPTY" }));
+          return;
+        }
+        
+        // Kick user from seat
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
+          [roomId, seatIndex]
+        );
+        
+        // Notify kicked user
+        sendToUser(seat.user_id, {
+          type: "seat_kicked",
+          room_id: roomId,
+          seat_index: seatIndex
+        });
+        
+        // Get updated seats
+        const seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "seats_update",
+          seats
+        });
+      }
+      
+      async function handleSeatLock(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, seat_index } = data;
+        const roomId = mustInt(room_id);
+        const seatIndex = mustInt(seat_index);
+        
+        if (!roomId || !seatIndex) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check permissions
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        const action = data.type; // 'seat_lock' or 'seat_unlock'
+        const isLocking = action === 'seat_lock';
+        
+        // Update seat lock status
+        await pool.execute(
+          "UPDATE voice_seats SET is_locked = ? WHERE room_id = ? AND seat_index = ?",
+          [isLocking ? 1 : 0, roomId, seatIndex]
+        );
+        
+        // If locking and seat is occupied, kick user
+        if (isLocking) {
+          const seat = await dbOne(
+            "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+            [roomId, seatIndex]
+          );
+          
+          if (seat && seat.user_id) {
+            await pool.execute(
+              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
+              [roomId, seatIndex]
+            );
+            
+            // Notify kicked user
+            sendToUser(seat.user_id, {
+              type: "seat_locked_kick",
+              room_id: roomId,
+              seat_index: seatIndex
+            });
+          }
+        }
+        
+        // Get updated seats
+        const seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "seats_update",
+          seats
+        });
+      }
+      
+      async function handleSeatMute(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, seat_index } = data;
+        const roomId = mustInt(room_id);
+        const seatIndex = mustInt(seat_index);
+        
+        if (!roomId || !seatIndex) {
+          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+          return;
+        }
+        
+        // Check permissions
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+          return;
+        }
+        
+        const action = data.type; // 'seat_mute' or 'seat_unmute'
+        const isMuting = action === 'seat_mute';
+        
+        // Update seat mute status
+        await pool.execute(
+          "UPDATE voice_seats SET is_muted = ? WHERE room_id = ? AND seat_index = ?",
+          [isMuting ? 1 : 0, roomId, seatIndex]
+        );
+        
+        // Get updated seats
+        const seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+        
+        broadcastToRoom(roomId, {
+          type: "seats_update",
+          seats
+        });
+      }
+      
+      async function handleWebRTCSignal(ws, data, userId) {
+        if (!userId) return;
+        
+        const { room_id, target_user_id, signal } = data;
+        const roomId = mustInt(room_id);
+        const targetUserId = mustInt(target_user_id);
+        
+        if (!roomId || !targetUserId || !signal) return;
+        
+        // Forward signal to target user
+        sendToUser(targetUserId, {
+          type: data.type,
+          from_user_id: userId,
+          signal: signal
+        });
+      }
+    });
+    
+    // Send initial welcome
+    ws.send(JSON.stringify({
+      type: "welcome",
+      message: "Connected to ProfileHub WebSocket server"
+    }));
   });
+  
+  // ================== HELPER FUNCTIONS ==================
+  async function cleanupOldMessages(roomId, limit) {
+    try {
+      const messages = await dbAll(`
+        SELECT id FROM messages 
+        WHERE room_id = ? AND deleted = FALSE 
+        ORDER BY id DESC 
+        LIMIT 18446744073709551615 OFFSET ?
+      `, [roomId, limit]);
+      
+      if (messages.length > 0) {
+        const ids = messages.map(m => m.id);
+        await pool.execute(
+          "UPDATE messages SET deleted = TRUE WHERE id IN (?)",
+          [ids]
+        );
+      }
+    } catch (error) {
+      console.error("Cleanup messages error:", error);
+    }
+  }
+  
+  // ================== START SERVER ==================
+  async function startServer() {
+    const dbInitialized = await initializeDatabase();
+    
+    if (!dbInitialized) {
+      console.error("❌ Failed to initialize database. Exiting...");
+      process.exit(1);
+    }
+    
+    server.listen(PORT, () => {
+      console.log(`✅ Server running on port ${PORT}`);
+      console.log(`🌐 WebSocket server ready`);
+      console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
+    });
+  }
+  
+  // Handle graceful shutdown
+  process.on("SIGINT", async () => {
+    console.log("Shutting down gracefully...");
+    
+    if (pool) {
+      await pool.end();
+    }
+    
+    wss.close(() => {
+      console.log("WebSocket server closed");
+      process.exit(0);
+    });
+  });
+  
+  // ================== ERROR HANDLING ==================
+  app.use((err, req, res, next) => {
+    console.error("Unhandled error:", err);
+    res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
+  });
+  
+  // 404 handler
+  app.use((req, res) => {
+    res.status(404).json({ error: "NOT_FOUND" });
+  });
+  
+  // ================== EXPORT FOR TESTING ==================
+  if (require.main === module) {
+    startServer();
+  } else {
+    module.exports = {
+      app,
+      server,
+      wss,
+      pool,
+      initializeDatabase,
+      startServer
+    };
+  }
 });
 
-// server-side heartbeat monitor
-setInterval(() => {
-  const now = Date.now();
-  for (const [ws, st] of WS_STATE.entries()) {
-    if (ws.readyState !== WebSocket.OPEN) continue;
-    if (now - (st.lastPong || 0) > 45000) {
-      try { ws.close(); } catch {}
-    } else {
-      wsSend(ws, { type: "ping" });
+// إذا كان الملف يتم تشغيله مباشرة
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  
+  initializeDatabase().then(dbInitialized => {
+    if (!dbInitialized) {
+      console.error("❌ Failed to initialize database. Exiting...");
+      process.exit(1);
     }
-  }
-}, 15000);
-
-/* ================== BOT RUNTIME ================== */
-async function maybeRunBots(roomId, text) {
-  const [bots] = await pool.execute("SELECT * FROM bots WHERE room_id=? AND enabled=1", [roomId]);
-  if (!bots.length) return;
-
-  const botIds = bots.map(b => b.id);
-  const [cmds] = await pool.query("SELECT * FROM bot_commands WHERE bot_id IN (?) AND enabled=1", [botIds]);
-
-  const msgText = String(text || "");
-  for (const cmd of cmds) {
-    const trig = String(cmd.trigger_text || "");
-    const mode = cmd.match_mode || "exact";
-    let hit = false;
-    if (mode === "exact") hit = msgText.trim() === trig;
-    if (mode === "starts_with") hit = msgText.startsWith(trig);
-    if (mode === "contains") hit = msgText.includes(trig);
-
-    if (hit) {
-      const bot = bots.find(b => b.id === cmd.bot_id);
-      const botName = bot?.name || "Bot";
-
-      // store as message type=bot
-      const [r] = await pool.execute(
-        "INSERT INTO messages (room_id,user_id,text,type,metadata) VALUES (?,?,?,?,?)",
-        [roomId, 0, cmd.response_text, "bot", JSON.stringify({ bot_id: cmd.bot_id, bot_name: botName, avatar_url: bot?.avatar_url || null })]
-      );
-
-      broadcastRoom(roomId, {
-        type: "bot_message",
-        room_id: roomId,
-        message: {
-          id: r.insertId,
-          room_id: roomId,
-          user_id: 0,
-          username: botName,
-          text: cmd.response_text,
-          type: "bot",
-          metadata: { bot_id: cmd.bot_id, bot_name: botName, avatar_url: bot?.avatar_url || null },
-          created_at: nowIso(),
-        }
-      });
-      break;
-    }
-  }
-}
-
-/* ================== START ================== */
-initializeDatabase()
-  .then(() => {
-    server.listen(PORT, () => console.log("✅ Server running on port", PORT));
-  })
-  .catch((err) => {
-    console.error("❌ Failed to init DB", err);
-    process.exit(1);
+    
+    server.listen(PORT, () => {
+      console.log(`✅ Server running on port ${PORT}`);
+      console.log(`🌐 WebSocket server ready`);
+      console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
+    });
   });
+}
