@@ -23,7 +23,7 @@ app.use(cors({
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3306;
 const server = http.createServer(app);
 
 // ================== DATABASE CONFIGURATION ==================
