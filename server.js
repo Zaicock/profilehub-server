@@ -148,7 +148,7 @@ async function authMiddleware(req, res, next) {
 function roleRank(role) {
   const ranks = {
     owner: 3,
-    developer: 3, // Developer has same rank as owner
+    developer: 3,
     admin: 2,
     member: 1,
   };
@@ -184,10 +184,7 @@ async function initializeDatabase() {
     pool = await mysql.createPool(DB_CONFIG);
     console.log("✅ Database connected successfully");
     
-    // Create tables if they don't exist
     await createTables();
-    
-    // Create default admin user if not exists
     await createDefaultAdmin();
     
     return true;
@@ -199,7 +196,6 @@ async function initializeDatabase() {
 
 async function createTables() {
   const tables = [
-    // Users table
     `CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
       username VARCHAR(50) UNIQUE NOT NULL,
@@ -224,7 +220,6 @@ async function createTables() {
       INDEX idx_banned (banned)
     )`,
     
-    // Frames table
     `CREATE TABLE IF NOT EXISTS frames (
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(100) NOT NULL,
@@ -240,7 +235,6 @@ async function createTables() {
       INDEX idx_available (available)
     )`,
     
-    // User frames (purchased frames)
     `CREATE TABLE IF NOT EXISTS user_frames (
       id INT AUTO_INCREMENT PRIMARY KEY,
       user_id INT NOT NULL,
@@ -252,7 +246,6 @@ async function createTables() {
       INDEX idx_user_id (user_id)
     )`,
     
-    // Rooms table
     `CREATE TABLE IF NOT EXISTS rooms (
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(100) NOT NULL,
@@ -271,7 +264,6 @@ async function createTables() {
       INDEX idx_owner_id (owner_id)
     )`,
     
-    // Room members table
     `CREATE TABLE IF NOT EXISTS room_members (
       id INT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
@@ -290,7 +282,6 @@ async function createTables() {
       INDEX idx_role (role)
     )`,
     
-    // Messages table
     `CREATE TABLE IF NOT EXISTS messages (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
@@ -311,7 +302,6 @@ async function createTables() {
       INDEX idx_deleted (deleted)
     )`,
     
-    // Points transactions table
     `CREATE TABLE IF NOT EXISTS point_transactions (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       from_user_id INT,
@@ -325,7 +315,6 @@ async function createTables() {
       INDEX idx_created_at (created_at)
     )`,
     
-    // Voice seats table
     `CREATE TABLE IF NOT EXISTS voice_seats (
       id INT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
@@ -341,7 +330,6 @@ async function createTables() {
       INDEX idx_user_id (user_id)
     )`,
     
-    // Bots table
     `CREATE TABLE IF NOT EXISTS bots (
       id INT AUTO_INCREMENT PRIMARY KEY,
       room_id INT NOT NULL,
@@ -357,7 +345,6 @@ async function createTables() {
       INDEX idx_enabled (enabled)
     )`,
     
-    // Bot commands table
     `CREATE TABLE IF NOT EXISTS bot_commands (
       id INT AUTO_INCREMENT PRIMARY KEY,
       bot_id INT NOT NULL,
@@ -371,7 +358,6 @@ async function createTables() {
       INDEX idx_enabled (enabled)
     )`,
     
-    // Subscriptions table
     `CREATE TABLE IF NOT EXISTS subscriptions (
       id INT AUTO_INCREMENT PRIMARY KEY,
       plan_key VARCHAR(50) UNIQUE NOT NULL,
@@ -386,7 +372,6 @@ async function createTables() {
       INDEX idx_is_active (is_active)
     )`,
     
-    // User subscriptions table
     `CREATE TABLE IF NOT EXISTS user_subscriptions (
       id INT AUTO_INCREMENT PRIMARY KEY,
       user_id INT NOT NULL,
@@ -405,7 +390,6 @@ async function createTables() {
       INDEX idx_status (status)
     )`,
     
-    // Payment methods table
     `CREATE TABLE IF NOT EXISTS payment_methods (
       id INT AUTO_INCREMENT PRIMARY KEY,
       method_key VARCHAR(50) UNIQUE NOT NULL,
@@ -417,7 +401,6 @@ async function createTables() {
       INDEX idx_is_active (is_active)
     )`,
     
-    // Server settings table
     `CREATE TABLE IF NOT EXISTS server_settings (
       setting_key VARCHAR(100) PRIMARY KEY,
       setting_value TEXT NOT NULL,
@@ -509,7 +492,6 @@ app.post("/api/register", async (req, res) => {
       return res.status(400).json({ error: "PASSWORD_TOO_SHORT" });
     }
     
-    // Check if username or email already exists
     const existingUser = await dbOne(
       "SELECT id FROM users WHERE username = ? OR email = ?",
       [username, email.toLowerCase()]
@@ -519,11 +501,9 @@ app.post("/api/register", async (req, res) => {
       return res.status(400).json({ error: "USER_ALREADY_EXISTS" });
     }
     
-    // Hash password
     const passwordHash = await hashPassword(password);
     const referralCode = crypto.randomBytes(6).toString("hex").toUpperCase();
     
-    // Check referral code
     let referredBy = null;
     let bonusPoints = 0;
     
@@ -535,9 +515,8 @@ app.post("/api/register", async (req, res) => {
       
       if (referrer) {
         referredBy = referrer.id;
-        bonusPoints = 1000; // Give 1000 points for using referral code
+        bonusPoints = 1000;
         
-        // Give points to referrer as well
         await pool.execute(
           "UPDATE users SET points = points + 500 WHERE id = ?",
           [referrer.id]
@@ -550,7 +529,6 @@ app.post("/api/register", async (req, res) => {
       }
     }
     
-    // Create user
     const [result] = await pool.execute(
       `INSERT INTO users (username, email, password_hash, points, referral_code, referred_by, settings_json) 
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -558,7 +536,7 @@ app.post("/api/register", async (req, res) => {
         username,
         email.toLowerCase(),
         passwordHash,
-        100 + bonusPoints, // Starting points + referral bonus
+        100 + bonusPoints,
         referralCode,
         referredBy,
         JSON.stringify({
@@ -573,7 +551,6 @@ app.post("/api/register", async (req, res) => {
     
     const userId = result.insertId;
     
-    // Add referral transaction if bonus points given
     if (bonusPoints > 0) {
       await pool.execute(
         "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
@@ -581,13 +558,11 @@ app.post("/api/register", async (req, res) => {
       );
     }
     
-    // Get user data
     const user = await dbOne(
       "SELECT id, username, email, is_developer, verified, points, avatar_url, bio, frame_id, created_at FROM users WHERE id = ?",
       [userId]
     );
     
-    // Generate token
     const token = generateToken(user);
     
     res.json({
@@ -610,7 +585,6 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ error: "MISSING_FIELDS" });
     }
     
-    // Find user by email or username
     const user = await dbOne(
       "SELECT id, username, email, password_hash, is_developer, verified, points, banned, avatar_url, bio, frame_id, created_at FROM users WHERE email = ? OR username = ?",
       [email.toLowerCase(), email]
@@ -624,22 +598,18 @@ app.post("/api/login", async (req, res) => {
       return res.status(403).json({ error: "ACCOUNT_BANNED" });
     }
     
-    // Verify password
     const validPassword = await verifyPassword(password, user.password_hash);
     if (!validPassword) {
       return res.status(401).json({ error: "INVALID_CREDENTIALS" });
     }
     
-    // Update last seen
     await pool.execute(
       "UPDATE users SET last_seen = ? WHERE id = ?",
       [nowIso(), user.id]
     );
     
-    // Remove password hash from response
     delete user.password_hash;
     
-    // Generate token
     const token = generateToken(user);
     
     res.json({
@@ -690,7 +660,6 @@ app.put("/api/profile", authMiddleware, async (req, res) => {
     }
     
     if (frame_id !== undefined) {
-      // Check if user owns the frame
       if (frame_id !== null) {
         const ownsFrame = await dbOne(
           "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
@@ -717,7 +686,6 @@ app.put("/api/profile", authMiddleware, async (req, res) => {
       params
     );
     
-    // Get updated user
     const updatedUser = await dbOne(
       "SELECT id, username, email, is_developer, verified, points, avatar_url, bio, links_json, frame_id, created_at FROM users WHERE id = ?",
       [req.user.id]
@@ -788,13 +756,11 @@ app.post("/api/rooms", authMiddleware, async (req, res) => {
     
     const roomId = roomResult.insertId;
     
-    // Add creator as owner member
     await pool.execute(
       "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'owner')",
       [roomId, req.user.id]
     );
     
-    // Create voice seats if voice room
     if (type === "voice") {
       const seats = [];
       for (let i = 1; i <= (voice_seats || 8); i++) {
@@ -809,7 +775,6 @@ app.post("/api/rooms", authMiddleware, async (req, res) => {
       }
     }
     
-    // Get created room
     const room = await dbOne(`
       SELECT r.*, 
              u.username as owner_name,
@@ -849,7 +814,6 @@ app.get("/api/rooms/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "ROOM_NOT_FOUND" });
     }
     
-    // Get room members
     const members = await dbAll(`
       SELECT rm.*, 
              u.username, 
@@ -871,7 +835,6 @@ app.get("/api/rooms/:id", authMiddleware, async (req, res) => {
         rm.joined_at ASC
     `, [roomId]);
     
-    // Get voice seats if voice room
     let seats = [];
     if (room.type === "voice") {
       seats = await dbAll(
@@ -880,7 +843,6 @@ app.get("/api/rooms/:id", authMiddleware, async (req, res) => {
       );
     }
     
-    // Check if user is member
     const isMember = members.some(m => m.user_id === req.user.id);
     
     res.json({
@@ -907,7 +869,6 @@ app.delete("/api/rooms/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "ROOM_NOT_FOUND" });
     }
     
-    // Check if user is owner or developer
     const isOwner = room.owner_id === req.user.id;
     const isDeveloper = req.user.is_developer;
     
@@ -935,7 +896,6 @@ app.get("/api/rooms/:id/messages", authMiddleware, async (req, res) => {
     const limit = mustInt(req.query.limit, 50);
     const beforeId = mustInt(req.query.before_id, 0);
     
-    // Check if user is room member
     const isMember = await dbOne(
       "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
       [roomId, req.user.id]
@@ -971,7 +931,6 @@ app.get("/api/rooms/:id/messages", authMiddleware, async (req, res) => {
     
     const messages = await dbAll(query, params);
     
-    // Reverse to get chronological order
     messages.reverse();
     
     res.json({
@@ -994,7 +953,6 @@ app.put("/api/messages/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "EMPTY_MESSAGE" });
     }
     
-    // Get message
     const message = await dbOne(
       "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
       [messageId]
@@ -1004,7 +962,6 @@ app.put("/api/messages/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "MESSAGE_NOT_FOUND" });
     }
     
-    // Check permissions
     const isOwner = message.user_id === req.user.id;
     const canModerate = await canModerateRoom(message.room_id, req.user.id);
     
@@ -1012,7 +969,6 @@ app.put("/api/messages/:id", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Update message
     await pool.execute(
       "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
       [text.trim(), nowIso(), messageId]
@@ -1033,14 +989,12 @@ app.delete("/api/messages/:id", authMiddleware, async (req, res) => {
   try {
     const messageId = mustInt(req.params.id);
     
-    // Get message
     const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
     
     if (!message) {
       return res.status(404).json({ error: "MESSAGE_NOT_FOUND" });
     }
     
-    // Check permissions
     const isOwner = message.user_id === req.user.id;
     const canModerate = await canModerateRoom(message.room_id, req.user.id);
     
@@ -1048,7 +1002,6 @@ app.delete("/api/messages/:id", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Delete message
     await pool.execute(
       "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
       [req.user.id, nowIso(), messageId]
@@ -1074,24 +1027,20 @@ app.post("/api/points/grant", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Only developers can grant points
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Check if target user exists
     const targetUser = await dbOne("SELECT id FROM users WHERE id = ?", [to_user_id]);
     if (!targetUser) {
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
     
-    // Grant points
     await pool.execute(
       "UPDATE users SET points = points + ? WHERE id = ?",
       [amount, to_user_id]
     );
     
-    // Record transaction
     await pool.execute(
       "INSERT INTO point_transactions (from_user_id, to_user_id, amount, reason) VALUES (?, ?, ?, ?)",
       [req.user.id, to_user_id, amount, reason || "منح من المطور"]
@@ -1116,27 +1065,22 @@ app.post("/api/points/deduct", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Only developers can deduct points
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Check if target user exists
     const targetUser = await dbOne("SELECT id, points FROM users WHERE id = ?", [to_user_id]);
     if (!targetUser) {
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
     
-    // Ensure user doesn't go below 0
     const newPoints = Math.max(0, targetUser.points - amount);
     
-    // Deduct points
     await pool.execute(
       "UPDATE users SET points = ? WHERE id = ?",
       [newPoints, to_user_id]
     );
     
-    // Record transaction
     await pool.execute(
       "INSERT INTO point_transactions (from_user_id, to_user_id, amount, reason) VALUES (?, ?, ?, ?)",
       [req.user.id, to_user_id, -amount, reason || "خصم من المطور"]
@@ -1163,22 +1107,18 @@ app.post("/api/rooms/:id/mute", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Calculate mute until time
     const muteUntil = new Date(Date.now() + minutes * 60000);
     
-    // Update user mute status
     await pool.execute(
       "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
       [muteUntil, roomId, target_user_id]
     );
     
-    // Add system message
     await pool.execute(
       "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
       [roomId, `تم كتم المستخدم لمدة ${minutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`]
@@ -1204,25 +1144,21 @@ app.post("/api/rooms/:id/ban", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Ban user
     await pool.execute(
       "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
       [roomId, target_user_id]
     );
     
-    // Remove from voice seats
     await pool.execute(
       "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
       [roomId, target_user_id]
     );
     
-    // Add system message
     await pool.execute(
       "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
       [roomId, `تم حظر المستخدم من الغرفة${reason ? ` - السبب: ${reason}` : ''}`]
@@ -1248,13 +1184,11 @@ app.post("/api/rooms/:id/unban", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Unban user
     await pool.execute(
       "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
       [roomId, target_user_id]
@@ -1280,19 +1214,16 @@ app.post("/api/rooms/:id/restrict", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Restrict user (mute indefinitely)
     await pool.execute(
       "UPDATE room_members SET muted_until = '2030-01-01 00:00:00' WHERE room_id = ? AND user_id = ?",
       [roomId, target_user_id]
     );
     
-    // Add system message
     await pool.execute(
       "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
       [roomId, `تم تقييد المستخدم${reason ? ` - السبب: ${reason}` : ''}`]
@@ -1314,13 +1245,11 @@ app.post("/api/rooms/:id/chat-lock", authMiddleware, async (req, res) => {
     const roomId = mustInt(req.params.id);
     const { locked, reason } = req.body;
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Update room settings
     const room = await dbOne("SELECT settings_json FROM rooms WHERE id = ?", [roomId]);
     const settings = room ? safeJsonParse(room.settings_json) || {} : {};
     
@@ -1331,7 +1260,6 @@ app.post("/api/rooms/:id/chat-lock", authMiddleware, async (req, res) => {
       [JSON.stringify(settings), roomId]
     );
     
-    // Add system message
     await pool.execute(
       "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
       [roomId, `تم ${settings.chat_locked ? 'قفل' : 'فتح'} الدردشة${reason ? ` - السبب: ${reason}` : ''}`]
@@ -1355,13 +1283,11 @@ app.post("/api/rooms/:id/autodelete", authMiddleware, async (req, res) => {
     
     const autoDeleteLimit = mustInt(limit, 0);
     
-    // Check permissions
     const canModerate = await canModerateRoom(roomId, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Update room settings
     const room = await dbOne("SELECT settings_json FROM rooms WHERE id = ?", [roomId]);
     const settings = room ? safeJsonParse(room.settings_json) || {} : {};
     
@@ -1372,7 +1298,6 @@ app.post("/api/rooms/:id/autodelete", authMiddleware, async (req, res) => {
       [JSON.stringify(settings), roomId]
     );
     
-    // If auto-delete limit is set, run cleanup
     if (autoDeleteLimit > 0) {
       await cleanupOldMessages(roomId, autoDeleteLimit);
     }
@@ -1401,7 +1326,6 @@ app.get("/api/frames", authMiddleware, async (req, res) => {
       ORDER BY f.created_at DESC
     `);
     
-    // Check which frames user owns
     const userFrames = await dbAll(
       "SELECT frame_id FROM user_frames WHERE user_id = ?",
       [req.user.id]
@@ -1434,7 +1358,6 @@ app.post("/api/frames", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "FRAME_NAME_REQUIRED" });
     }
     
-    // Only developers can create frames
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
@@ -1475,7 +1398,6 @@ app.post("/api/frames/purchase", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "FRAME_ID_REQUIRED" });
     }
     
-    // Get frame
     const frame = await dbOne(
       "SELECT id, price_points, available FROM frames WHERE id = ?",
       [frame_id]
@@ -1489,7 +1411,6 @@ app.post("/api/frames/purchase", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "FRAME_NOT_AVAILABLE" });
     }
     
-    // Check if already owned
     const alreadyOwned = await dbOne(
       "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
       [req.user.id, frame_id]
@@ -1499,26 +1420,22 @@ app.post("/api/frames/purchase", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "FRAME_ALREADY_OWNED" });
     }
     
-    // Check if user has enough points
     if (frame.price_points > 0 && req.user.points < frame.price_points) {
       return res.status(400).json({ error: "INSUFFICIENT_POINTS" });
     }
     
-    // Deduct points if frame costs points
     if (frame.price_points > 0) {
       await pool.execute(
         "UPDATE users SET points = points - ? WHERE id = ?",
         [frame.price_points, req.user.id]
       );
       
-      // Record transaction
       await pool.execute(
         "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
         [req.user.id, -frame.price_points, `شراء إطار: ${frame_id}`]
       );
     }
     
-    // Add frame to user
     await pool.execute(
       "INSERT INTO user_frames (user_id, frame_id) VALUES (?, ?)",
       [req.user.id, frame_id]
@@ -1539,7 +1456,6 @@ app.post("/api/frames/select", authMiddleware, async (req, res) => {
   try {
     const { frame_id } = req.body;
     
-    // If frame_id is null, user wants to remove frame
     if (frame_id === null) {
       await pool.execute(
         "UPDATE users SET frame_id = NULL WHERE id = ?",
@@ -1552,7 +1468,6 @@ app.post("/api/frames/select", authMiddleware, async (req, res) => {
       });
     }
     
-    // Check if user owns the frame
     const ownsFrame = await dbOne(
       "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
       [req.user.id, frame_id]
@@ -1562,7 +1477,6 @@ app.post("/api/frames/select", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "FRAME_NOT_OWNED" });
     }
     
-    // Select frame
     await pool.execute(
       "UPDATE users SET frame_id = ? WHERE id = ?",
       [frame_id, req.user.id]
@@ -1587,24 +1501,20 @@ app.post("/api/frames/grant", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Only developers can grant frames
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Check if frame exists
     const frame = await dbOne("SELECT id FROM frames WHERE id = ?", [frame_id]);
     if (!frame) {
       return res.status(404).json({ error: "FRAME_NOT_FOUND" });
     }
     
-    // Check if user exists
     const user = await dbOne("SELECT id FROM users WHERE id = ?", [user_id]);
     if (!user) {
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
     
-    // Check if already owned
     const alreadyOwned = await dbOne(
       "SELECT id FROM user_frames WHERE user_id = ? AND frame_id = ?",
       [user_id, frame_id]
@@ -1614,7 +1524,6 @@ app.post("/api/frames/grant", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "FRAME_ALREADY_OWNED" });
     }
     
-    // Grant frame
     await pool.execute(
       "INSERT INTO user_frames (user_id, frame_id) VALUES (?, ?)",
       [user_id, frame_id]
@@ -1678,7 +1587,6 @@ app.post("/api/subscriptions/subscribe", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Get subscription
     const subscription = await dbOne(
       "SELECT * FROM subscriptions WHERE id = ? AND is_active = TRUE",
       [subscription_id]
@@ -1688,7 +1596,6 @@ app.post("/api/subscriptions/subscribe", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "SUBSCRIPTION_NOT_FOUND" });
     }
     
-    // Check payment method
     const paymentMethod = await dbOne(
       "SELECT * FROM payment_methods WHERE method_key = ? AND is_active = TRUE",
       [payment_method]
@@ -1701,12 +1608,10 @@ app.post("/api/subscriptions/subscribe", authMiddleware, async (req, res) => {
     const numMonths = Math.max(1, mustInt(months, 1));
     const durationDays = subscription.duration_days * numMonths;
     
-    // Calculate dates
     const startDate = new Date();
     const endDate = new Date(startDate);
     endDate.setDate(endDate.getDate() + durationDays);
     
-    // Create subscription record
     const [result] = await pool.execute(
       `INSERT INTO user_subscriptions (user_id, subscription_id, status, start_date, end_date, payment_method, transaction_id)
        VALUES (?, ?, 'pending', ?, ?, ?, ?)`,
@@ -1737,7 +1642,6 @@ app.get("/api/rooms/:id/bots", authMiddleware, async (req, res) => {
   try {
     const roomId = mustInt(req.params.id);
     
-    // Check if user is room member
     const isMember = await dbOne(
       "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
       [roomId, req.user.id]
@@ -1755,7 +1659,6 @@ app.get("/api/rooms/:id/bots", authMiddleware, async (req, res) => {
       ORDER BY b.created_at ASC
     `, [roomId]);
     
-    // Get commands for each bot
     const botsWithCommands = await Promise.all(
       bots.map(async (bot) => {
         const commands = await dbAll(
@@ -1785,7 +1688,6 @@ app.post("/api/bots", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Check if user can create bots in this room
     const canModerate = await canModerateRoom(room_id, req.user.id);
     if (!canModerate) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
@@ -1826,13 +1728,11 @@ app.post("/api/bots/:id/commands", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "INVALID_PARAMETERS" });
     }
     
-    // Get bot
     const bot = await dbOne("SELECT * FROM bots WHERE id = ?", [botId]);
     if (!bot) {
       return res.status(404).json({ error: "BOT_NOT_FOUND" });
     }
     
-    // Check if user can manage this bot
     const canModerate = await canModerateRoom(bot.room_id, req.user.id);
     const isCreator = bot.created_by === req.user.id;
     
@@ -1866,7 +1766,6 @@ app.post("/api/bots/:id/commands", authMiddleware, async (req, res) => {
 // ===== Admin Routes =====
 app.get("/api/admin/users", authMiddleware, async (req, res) => {
   try {
-    // Only developers can access this
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
@@ -1893,12 +1792,10 @@ app.post("/api/admin/users/:id/toggle-ban", authMiddleware, async (req, res) => 
   try {
     const userId = mustInt(req.params.id);
     
-    // Only developers can ban users
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
     
-    // Cannot ban yourself
     if (userId === req.user.id) {
       return res.status(400).json({ error: "CANNOT_BAN_SELF" });
     }
@@ -1908,7 +1805,6 @@ app.post("/api/admin/users/:id/toggle-ban", authMiddleware, async (req, res) => 
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
     
-    // Toggle ban status
     const newBanStatus = !user.banned;
     
     await pool.execute(
@@ -1932,7 +1828,6 @@ app.post("/api/admin/users/:id/toggle-verify", authMiddleware, async (req, res) 
   try {
     const userId = mustInt(req.params.id);
     
-    // Only developers can verify users
     if (!req.user.is_developer) {
       return res.status(403).json({ error: "PERMISSION_DENIED" });
     }
@@ -1942,7 +1837,6 @@ app.post("/api/admin/users/:id/toggle-verify", authMiddleware, async (req, res) 
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
     
-    // Toggle verify status
     const newVerifyStatus = !user.verified;
     
     await pool.execute(
@@ -1965,11 +1859,9 @@ app.post("/api/admin/users/:id/toggle-verify", authMiddleware, async (req, res) 
 // ================== WEBSOCKET SERVER ==================
 const wss = new WebSocket.Server({ server });
 
-// Store connected clients
-const clients = new Map(); // userId -> { ws, rooms: Set<roomId> }
-const roomClients = new Map(); // roomId -> Set<ws>
+const clients = new Map();
+const roomClients = new Map();
 
-// Helper functions
 function broadcastToRoom(roomId, message, excludeUserId = null) {
   const clientsInRoom = roomClients.get(roomId);
   if (!clientsInRoom) return;
@@ -1991,7 +1883,27 @@ function sendToUser(userId, message) {
   }
 }
 
-// WebSocket connection handler
+async function cleanupOldMessages(roomId, limit) {
+  try {
+    const messages = await dbAll(`
+      SELECT id FROM messages 
+      WHERE room_id = ? AND deleted = FALSE 
+      ORDER BY id DESC 
+      LIMIT 18446744073709551615 OFFSET ?
+    `, [roomId, limit]);
+    
+    if (messages.length > 0) {
+      const ids = messages.map(m => m.id);
+      await pool.execute(
+        "UPDATE messages SET deleted = TRUE WHERE id IN (?)",
+        [ids]
+      );
+    }
+  } catch (error) {
+    console.error("Cleanup messages error:", error);
+  }
+}
+
 wss.on("connection", (ws) => {
   let userId = null;
   let userData = null;
@@ -2079,11 +1991,10 @@ wss.on("connection", (ws) => {
     }
   });
   
-  ws.on("close", () => {
+  ws.on("close", async () => {
     if (userId && clients.has(userId)) {
       const clientData = clients.get(userId);
       
-      // Leave all rooms
       if (clientData.rooms) {
         clientData.rooms.forEach(roomId => {
           const roomSet = roomClients.get(roomId);
@@ -2096,17 +2007,19 @@ wss.on("connection", (ws) => {
         });
       }
       
-      // Remove from voice seats
       if (userData) {
-        pool.execute(
-          "UPDATE voice_seats SET user_id = NULL WHERE user_id = ?",
-          [userId]
-        ).catch(console.error);
+        try {
+          await pool.execute(
+            "UPDATE voice_seats SET user_id = NULL WHERE user_id = ?",
+            [userId]
+          );
+        } catch (error) {
+          console.error("Error clearing voice seats:", error);
+        }
       }
       
       clients.delete(userId);
       
-      // Notify rooms about user leaving
       if (clientData.rooms) {
         clientData.rooms.forEach(roomId => {
           broadcastToRoom(roomId, {
@@ -2120,7 +2033,6 @@ wss.on("connection", (ws) => {
     }
   });
   
-  // Handle authentication
   async function handleAuth(ws, data) {
     const token = data.token;
     if (!token) {
@@ -2167,7 +2079,6 @@ wss.on("connection", (ws) => {
     }));
   }
   
-  // Handle joining a room
   async function handleJoinRoom(ws, data, userId) {
     if (!userId) {
       ws.send(JSON.stringify({ type: "join_room", ok: false, error: "NOT_AUTHENTICATED" }));
@@ -2180,14 +2091,12 @@ wss.on("connection", (ws) => {
       return;
     }
     
-    // Check if room exists
     const room = await dbOne("SELECT * FROM rooms WHERE id = ?", [roomId]);
     if (!room) {
       ws.send(JSON.stringify({ type: "join_room", ok: false, error: "ROOM_NOT_FOUND" }));
       return;
     }
     
-    // Check if user is banned from room
     const isBanned = await dbOne(
       "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = TRUE",
       [roomId, userId]
@@ -2198,7 +2107,6 @@ wss.on("connection", (ws) => {
       return;
     }
     
-    // Check if room is full
     const memberCount = await dbOne(
       "SELECT COUNT(*) as count FROM room_members WHERE room_id = ? AND is_banned = FALSE",
       [roomId]
@@ -2209,7 +2117,6 @@ wss.on("connection", (ws) => {
       return;
     }
     
-    // Check if user has enough points to join (if room has price)
     if (room.price_points > 0) {
       const user = await dbOne("SELECT points FROM users WHERE id = ?", [userId]);
       if (user.points < room.price_points) {
@@ -2217,1127 +2124,1002 @@ wss.on("connection", (ws) => {
         return;
       }
       
-      // Deduct points
       await pool.execute(
         "UPDATE users SET points = points - ? WHERE id = ?",
         [room.price_points, userId]
       );
       
-      // Record transaction
-         await pool.execute(
+      await pool.execute(
         "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
-          [userId, -room.price_points, `رسوم الانضمام للغرفة: ${room.name}`]
-         );
-
-
-         // ... (استمرار من الجزء السابق)
-
-        // Add user to room members if not already a member
-        const existingMember = await dbOne(
-          "SELECT id FROM room_members WHERE room_id = ? AND user_id = ?",
-          [roomId, userId]
-        );
-
-        if (!existingMember) {
-          await pool.execute(
-            "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'member')",
-            [roomId, userId]
-          );
-
-          // Add system message
-          await pool.execute(
-            "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-            [roomId, `${userData.username} انضم للغرفة`]
-          );
-        }
-
-        // Add to WebSocket room tracking
-        const clientData = clients.get(userId);
-        if (clientData) {
-          clientData.rooms.add(roomId);
-        }
-
-        if (!roomClients.has(roomId)) {
-          roomClients.set(roomId, new Set());
-        }
-        roomClients.get(roomId).add(ws);
-
-        // Get room members
-        const members = await dbAll(`
-          SELECT rm.*, 
-                 u.username, 
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified,
-                 u.points
-          FROM room_members rm
-          LEFT JOIN users u ON rm.user_id = u.id
-          WHERE rm.room_id = ? AND rm.is_banned = FALSE
-        `, [roomId]);
-
-        // Get messages
-        const messages = await dbAll(`
-          SELECT m.*, 
-                 u.username,
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified
-          FROM messages m
-          LEFT JOIN users u ON m.user_id = u.id
-          WHERE m.room_id = ? AND m.deleted = FALSE
-          ORDER BY m.id DESC
-          LIMIT 100
-        `, [roomId]);
-
-        // Get voice seats if voice room
-        let seats = [];
-        if (room.type === "voice") {
-          seats = await dbAll(
-            "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-            [roomId]
-          );
-        }
-
-        ws.send(JSON.stringify({
-          type: "join_room",
-          ok: true,
-          room: {
-            ...room,
-            members: members.map(m => ({
-              user_id: m.user_id,
-              username: m.username,
-              avatar_url: m.avatar_url,
-              role: m.role,
-              muted_until: m.muted_until,
-              label_text: m.label_text,
-              label_color: m.label_color,
-              is_developer: m.is_developer,
-              verified: m.verified,
-              points: m.points
-            }))
-          },
-          messages: messages.reverse(),
-          seats
-        }));
-
-        // Notify others
-        broadcastToRoom(roomId, {
-          type: "user_joined",
-          user: {
-            id: userId,
-            username: userData.username,
-            avatar_url: userData.avatar_url,
-            is_developer: userData.is_developer,
-            verified: userData.verified
-          }
-        }, userId);
-      }
+        [userId, -room.price_points, `رسوم الانضمام للغرفة: ${room.name}`]
+      );
+    }
+    
+    const existingMember = await dbOne(
+      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ?",
+      [roomId, userId]
+    );
+    
+    if (!existingMember) {
+      await pool.execute(
+        "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'member')",
+        [roomId, userId]
+      );
       
-      async function handleLeaveRoom(ws, data, userId) {
-        if (!userId) {
-          ws.send(JSON.stringify({ type: "error", error: "NOT_AUTHENTICATED" }));
+      await pool.execute(
+        "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+        [roomId, `${userData.username} انضم للغرفة`]
+      );
+    }
+    
+    const clientData = clients.get(userId);
+    if (clientData) {
+      clientData.rooms.add(roomId);
+    }
+    
+    if (!roomClients.has(roomId)) {
+      roomClients.set(roomId, new Set());
+    }
+    roomClients.get(roomId).add(ws);
+    
+    const members = await dbAll(`
+      SELECT rm.*, 
+             u.username, 
+             u.avatar_url,
+             u.is_developer,
+             u.verified,
+             u.points
+      FROM room_members rm
+      LEFT JOIN users u ON rm.user_id = u.id
+      WHERE rm.room_id = ? AND rm.is_banned = FALSE
+    `, [roomId]);
+    
+    const messages = await dbAll(`
+      SELECT m.*, 
+             u.username,
+             u.avatar_url,
+             u.is_developer,
+             u.verified
+      FROM messages m
+      LEFT JOIN users u ON m.user_id = u.id
+      WHERE m.room_id = ? AND m.deleted = FALSE
+      ORDER BY m.id DESC
+      LIMIT 100
+    `, [roomId]);
+    
+    let seats = [];
+    if (room.type === "voice") {
+      seats = await dbAll(
+        "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+        [roomId]
+      );
+    }
+    
+    ws.send(JSON.stringify({
+      type: "join_room",
+      ok: true,
+      room: {
+        ...room,
+        members: members.map(m => ({
+          user_id: m.user_id,
+          username: m.username,
+          avatar_url: m.avatar_url,
+          role: m.role,
+          muted_until: m.muted_until,
+          label_text: m.label_text,
+          label_color: m.label_color,
+          is_developer: m.is_developer,
+          verified: m.verified,
+          points: m.points
+        }))
+      },
+      messages: messages.reverse(),
+      seats
+    }));
+    
+    broadcastToRoom(roomId, {
+      type: "user_joined",
+      user: {
+        id: userId,
+        username: userData.username,
+        avatar_url: userData.avatar_url,
+        is_developer: userData.is_developer,
+        verified: userData.verified
+      }
+    }, userId);
+  }
+  
+  async function handleLeaveRoom(ws, data, userId) {
+    if (!userId) {
+      ws.send(JSON.stringify({ type: "error", error: "NOT_AUTHENTICATED" }));
+      return;
+    }
+    
+    const roomId = mustInt(data.room_id);
+    if (!roomId) return;
+    
+    const clientData = clients.get(userId);
+    if (clientData) {
+      clientData.rooms.delete(roomId);
+    }
+    
+    const roomSet = roomClients.get(roomId);
+    if (roomSet) {
+      roomSet.delete(ws);
+      if (roomSet.size === 0) {
+        roomClients.delete(roomId);
+      }
+    }
+    
+    await pool.execute(
+      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+      [roomId, userId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "user_left",
+      user_id: userId,
+      username: userData?.username
+    });
+    
+    ws.send(JSON.stringify({
+      type: "leave_room",
+      ok: true,
+      room_id: roomId
+    }));
+  }
+  
+  async function handleChat(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, text, message_type, metadata } = data;
+    const roomId = mustInt(room_id);
+    
+    if (!roomId || !text || text.trim().length === 0) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
+      return;
+    }
+    
+    const member = await dbOne(
+      "SELECT * FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+      [roomId, userId]
+    );
+    
+    if (!member) {
+      ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
+      return;
+    }
+    
+    if (member.muted_until && new Date(member.muted_until) > new Date()) {
+      ws.send(JSON.stringify({ type: "error", error: "USER_MUTED" }));
+      return;
+    }
+    
+    const room = await dbOne(
+      "SELECT settings_json FROM rooms WHERE id = ?",
+      [roomId]
+    );
+    
+    if (room) {
+      const settings = safeJsonParse(room.settings_json) || {};
+      if (settings.chat_locked) {
+        const canModerate = await canModerateRoom(roomId, userId);
+        if (!canModerate) {
+          ws.send(JSON.stringify({ type: "error", error: "CHAT_LOCKED" }));
           return;
         }
-        
-        const roomId = mustInt(data.room_id);
-        if (!roomId) return;
-        
-        const clientData = clients.get(userId);
-        if (clientData) {
-          clientData.rooms.delete(roomId);
+      }
+    }
+    
+    const bots = await dbAll(`
+      SELECT b.*, c.trigger_text, c.response_text, c.match_type
+      FROM bots b
+      LEFT JOIN bot_commands c ON b.id = c.bot_id
+      WHERE b.room_id = ? AND b.enabled = TRUE AND c.enabled = TRUE
+    `, [roomId]);
+    
+    let botResponse = null;
+    for (const bot of bots) {
+      if (!bot.trigger_text || !bot.response_text) continue;
+      
+      let shouldRespond = false;
+      const messageText = text.trim().toLowerCase();
+      const triggerText = bot.trigger_text.toLowerCase();
+      
+      switch (bot.match_type) {
+        case "exact":
+          shouldRespond = messageText === triggerText;
+          break;
+        case "starts_with":
+          shouldRespond = messageText.startsWith(triggerText);
+          break;
+        case "contains":
+          shouldRespond = messageText.includes(triggerText);
+          break;
+      }
+      
+      if (shouldRespond) {
+        botResponse = {
+          bot_id: bot.id,
+          bot_name: bot.name,
+          avatar_url: bot.avatar_url,
+          response: bot.response_text
+        };
+        break;
+      }
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        roomId,
+        userId,
+        text.trim(),
+        message_type || "text",
+        JSON.stringify(metadata || {})
+      ]
+    );
+    
+    const messageId = result.insertId;
+    
+    const message = await dbOne(`
+      SELECT m.*, 
+             u.username,
+             u.avatar_url,
+             u.is_developer,
+             u.verified,
+             rm.label_text,
+             rm.label_color
+      FROM messages m
+      LEFT JOIN users u ON m.user_id = u.id
+      LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+      WHERE m.id = ?
+    `, [messageId]);
+    
+    broadcastToRoom(roomId, {
+      type: "chat",
+      message
+    });
+    
+    if (botResponse) {
+      const [botResult] = await pool.execute(
+        `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
+         VALUES (?, 0, ?, 'bot', ?)`,
+        [
+          roomId,
+          botResponse.response,
+          JSON.stringify({
+            bot_id: botResponse.bot_id,
+            bot_name: botResponse.bot_name,
+            avatar_url: botResponse.avatar_url
+          })
+        ]
+      );
+      
+      const botMessageId = botResult.insertId;
+      const botMessage = await dbOne(
+        "SELECT * FROM messages WHERE id = ?",
+        [botMessageId]
+      );
+      
+      broadcastToRoom(roomId, {
+        type: "chat",
+        message: {
+          ...botMessage,
+          username: botResponse.bot_name,
+          avatar_url: botResponse.avatar_url,
+          is_developer: false,
+          verified: false
         }
+      });
+    }
+    
+    if (room) {
+      const settings = safeJsonParse(room.settings_json) || {};
+      if (settings.auto_delete_limit > 0) {
+        await cleanupOldMessages(roomId, settings.auto_delete_limit);
+      }
+    }
+  }
+  
+  async function handleTyping(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, is_typing } = data;
+    const roomId = mustInt(room_id);
+    
+    broadcastToRoom(roomId, {
+      type: "typing",
+      user_id: userId,
+      username: userData?.username,
+      is_typing: !!is_typing
+    }, userId);
+  }
+  
+  async function handleEditMessage(ws, data, userId) {
+    if (!userId) return;
+    
+    const { message_id, text } = data;
+    const messageId = mustInt(message_id);
+    
+    if (!messageId || !text || text.trim().length === 0) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const message = await dbOne(
+      "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
+      [messageId]
+    );
+    
+    if (!message) {
+      ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
+      return;
+    }
+    
+    const isOwner = message.user_id === userId;
+    const canModerate = await canModerateRoom(message.room_id, userId);
+    
+    if (!isOwner && !canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
+      [text.trim(), nowIso(), messageId]
+    );
+    
+    const updatedMessage = await dbOne(`
+      SELECT m.*, 
+             u.username,
+             u.avatar_url,
+             u.is_developer,
+             u.verified,
+             rm.label_text,
+             rm.label_color
+      FROM messages m
+      LEFT JOIN users u ON m.user_id = u.id
+      LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+      WHERE m.id = ?
+    `, [messageId]);
+    
+    broadcastToRoom(message.room_id, {
+      type: "edit_message",
+      message: updatedMessage
+    });
+  }
+  
+  async function handleDeleteMessage(ws, data, userId) {
+    if (!userId) return;
+    
+    const { message_id, reason } = data;
+    const messageId = mustInt(message_id);
+    
+    if (!messageId) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE_ID" }));
+      return;
+    }
+    
+    const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
+    
+    if (!message) {
+      ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
+      return;
+    }
+    
+    const isOwner = message.user_id === userId;
+    const canModerate = await canModerateRoom(message.room_id, userId);
+    
+    if (!isOwner && !canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
+      [userId, nowIso(), messageId]
+    );
+    
+    broadcastToRoom(message.room_id, {
+      type: "delete_message",
+      message_id: messageId,
+      deleted_by: userId,
+      reason: reason || ""
+    });
+  }
+  
+  async function handleModerate(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, action, target_user_id, duration, reason } = data;
+    const roomId = mustInt(room_id);
+    const targetUserId = mustInt(target_user_id);
+    
+    if (!roomId || !action || !targetUserId) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const canModerate = await canModerateRoom(roomId, userId);
+    if (!canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    if (targetUserId === userId) {
+      ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_SELF" }));
+      return;
+    }
+    
+    const targetMember = await getRoomMember(roomId, targetUserId);
+    if (!targetMember) {
+      ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
+      return;
+    }
+    
+    const userMember = await getRoomMember(roomId, userId);
+    const userRank = roleRank(userMember?.role);
+    const targetRank = roleRank(targetMember.role);
+    
+    if (targetRank >= userRank) {
+      ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_HIGHER_RANK" }));
+      return;
+    }
+    
+    let message = "";
+    
+    switch (action) {
+      case "mute":
+        const muteMinutes = mustInt(duration, 5);
+        const muteUntil = new Date(Date.now() + muteMinutes * 60000);
         
-        const roomSet = roomClients.get(roomId);
-        if (roomSet) {
-          roomSet.delete(ws);
-          if (roomSet.size === 0) {
-            roomClients.delete(roomId);
-          }
-        }
+        await pool.execute(
+          "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
+          [muteUntil, roomId, targetUserId]
+        );
         
-        // Remove from voice seat
+        message = `تم كتم ${targetMember.username} لمدة ${muteMinutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`;
+        break;
+        
+      case "unmute":
+        await pool.execute(
+          "UPDATE room_members SET muted_until = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, targetUserId]
+        );
+        
+        message = `تم إلغاء كتم ${targetMember.username}`;
+        break;
+        
+      case "ban":
+        await pool.execute(
+          "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
+          [roomId, targetUserId]
+        );
+        
         await pool.execute(
           "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-          [roomId, userId]
+          [roomId, targetUserId]
         );
         
-        broadcastToRoom(roomId, {
-          type: "user_left",
-          user_id: userId,
-          username: userData?.username
-        });
-        
-        ws.send(JSON.stringify({
-          type: "leave_room",
-          ok: true,
-          room_id: roomId
-        }));
-      }
-      
-      async function handleChat(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, text, message_type, metadata } = data;
-        const roomId = mustInt(room_id);
-        
-        if (!roomId || !text || text.trim().length === 0) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
-          return;
-        }
-        
-        // Check if user is member of room
-        const member = await dbOne(
-          "SELECT * FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
-          [roomId, userId]
-        );
-        
-        if (!member) {
-          ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
-          return;
-        }
-        
-        // Check if user is muted
-        if (member.muted_until && new Date(member.muted_until) > new Date()) {
-          ws.send(JSON.stringify({ type: "error", error: "USER_MUTED" }));
-          return;
-        }
-        
-        // Check if chat is locked
-        const room = await dbOne(
-          "SELECT settings_json FROM rooms WHERE id = ?",
-          [roomId]
-        );
-        
-        if (room) {
-          const settings = safeJsonParse(room.settings_json) || {};
-          if (settings.chat_locked) {
-            // Check if user can bypass lock (moderator or owner)
-            const canModerate = await canModerateRoom(roomId, userId);
-            if (!canModerate) {
-              ws.send(JSON.stringify({ type: "error", error: "CHAT_LOCKED" }));
-              return;
-            }
-          }
-        }
-        
-        // Process bot commands
-        const bots = await dbAll(`
-          SELECT b.*, c.trigger_text, c.response_text, c.match_type
-          FROM bots b
-          LEFT JOIN bot_commands c ON b.id = c.bot_id
-          WHERE b.room_id = ? AND b.enabled = TRUE AND c.enabled = TRUE
-        `, [roomId]);
-        
-        let botResponse = null;
-        for (const bot of bots) {
-          if (!bot.trigger_text || !bot.response_text) continue;
+        const targetClient = clients.get(targetUserId);
+        if (targetClient) {
+          targetClient.ws.send(JSON.stringify({
+            type: "banned",
+            room_id: roomId,
+            reason: reason || ""
+          }));
           
-          let shouldRespond = false;
-          const messageText = text.trim().toLowerCase();
-          const triggerText = bot.trigger_text.toLowerCase();
-          
-          switch (bot.match_type) {
-            case "exact":
-              shouldRespond = messageText === triggerText;
-              break;
-            case "starts_with":
-              shouldRespond = messageText.startsWith(triggerText);
-              break;
-            case "contains":
-              shouldRespond = messageText.includes(triggerText);
-              break;
-          }
-          
-          if (shouldRespond) {
-            botResponse = {
-              bot_id: bot.id,
-              bot_name: bot.name,
-              avatar_url: bot.avatar_url,
-              response: bot.response_text
-            };
-            break;
-          }
+          targetClient.rooms.delete(roomId);
         }
         
-        // Insert message
-        const [result] = await pool.execute(
-          `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
-           VALUES (?, ?, ?, ?, ?)`,
-          [
-            roomId,
-            userId,
-            text.trim(),
-            message_type || "text",
-            JSON.stringify(metadata || {})
-          ]
-        );
+        message = `تم حظر ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
+        break;
         
-        const messageId = result.insertId;
-        
-        // Get message with user info
-        const message = await dbOne(`
-          SELECT m.*, 
-                 u.username,
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified,
-                 rm.label_text,
-                 rm.label_color
-          FROM messages m
-          LEFT JOIN users u ON m.user_id = u.id
-          LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
-          WHERE m.id = ?
-        `, [messageId]);
-        
-        // Broadcast message
-        broadcastToRoom(roomId, {
-          type: "chat",
-          message
-        });
-        
-        // Send bot response if any
-        if (botResponse) {
-          // Insert bot message
-          const [botResult] = await pool.execute(
-            `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
-             VALUES (?, 0, ?, 'bot', ?)`,
-            [
-              roomId,
-              botResponse.response,
-              JSON.stringify({
-                bot_id: botResponse.bot_id,
-                bot_name: botResponse.bot_name,
-                avatar_url: botResponse.avatar_url
-              })
-            ]
-          );
-          
-          const botMessageId = botResult.insertId;
-          const botMessage = await dbOne(
-            "SELECT * FROM messages WHERE id = ?",
-            [botMessageId]
-          );
-          
-          broadcastToRoom(roomId, {
-            type: "chat",
-            message: {
-              ...botMessage,
-              username: botResponse.bot_name,
-              avatar_url: botResponse.avatar_url,
-              is_developer: false,
-              verified: false
-            }
-          });
-        }
-        
-        // Auto-delete old messages if limit is set
-        if (room) {
-          const settings = safeJsonParse(room.settings_json) || {};
-          if (settings.auto_delete_limit > 0) {
-            await cleanupOldMessages(roomId, settings.auto_delete_limit);
-          }
-        }
-      }
-      
-      async function handleTyping(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, is_typing } = data;
-        const roomId = mustInt(room_id);
-        
-        broadcastToRoom(roomId, {
-          type: "typing",
-          user_id: userId,
-          username: userData?.username,
-          is_typing: !!is_typing
-        }, userId);
-      }
-      
-      async function handleEditMessage(ws, data, userId) {
-        if (!userId) return;
-        
-        const { message_id, text } = data;
-        const messageId = mustInt(message_id);
-        
-        if (!messageId || !text || text.trim().length === 0) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Get message
-        const message = await dbOne(
-          "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
-          [messageId]
-        );
-        
-        if (!message) {
-          ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
-          return;
-        }
-        
-        // Check permissions
-        const isOwner = message.user_id === userId;
-        const canModerate = await canModerateRoom(message.room_id, userId);
-        
-        if (!isOwner && !canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Update message
+      case "unban":
         await pool.execute(
-          "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
-          [text.trim(), nowIso(), messageId]
+          "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
+          [roomId, targetUserId]
         );
         
-        // Get updated message
-        const updatedMessage = await dbOne(`
-          SELECT m.*, 
-                 u.username,
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified,
-                 rm.label_text,
-                 rm.label_color
-          FROM messages m
-          LEFT JOIN users u ON m.user_id = u.id
-          LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
-          WHERE m.id = ?
-        `, [messageId]);
+        message = `تم إلغاء حظر ${targetMember.username}`;
+        break;
         
-        broadcastToRoom(message.room_id, {
-          type: "edit_message",
-          message: updatedMessage
-        });
-      }
-      
-      async function handleDeleteMessage(ws, data, userId) {
-        if (!userId) return;
-        
-        const { message_id, reason } = data;
-        const messageId = mustInt(message_id);
-        
-        if (!messageId) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE_ID" }));
-          return;
-        }
-        
-        // Get message
-        const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
-        
-        if (!message) {
-          ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
-          return;
-        }
-        
-        // Check permissions
-        const isOwner = message.user_id === userId;
-        const canModerate = await canModerateRoom(message.room_id, userId);
-        
-        if (!isOwner && !canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Delete message
+      case "kick":
         await pool.execute(
-          "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
-          [userId, nowIso(), messageId]
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, targetUserId]
         );
         
-        broadcastToRoom(message.room_id, {
-          type: "delete_message",
-          message_id: messageId,
-          deleted_by: userId,
-          reason: reason || ""
-        });
-      }
-      
-      async function handleModerate(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, action, target_user_id, duration, reason } = data;
-        const roomId = mustInt(room_id);
-        const targetUserId = mustInt(target_user_id);
-        
-        if (!roomId || !action || !targetUserId) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check permissions
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Cannot moderate yourself
-        if (targetUserId === userId) {
-          ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_SELF" }));
-          return;
-        }
-        
-        // Check target user's role
-        const targetMember = await getRoomMember(roomId, targetUserId);
-        if (!targetMember) {
-          ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
-          return;
-        }
-        
-        // Cannot moderate users with same or higher rank
-        const userMember = await getRoomMember(roomId, userId);
-        const userRank = roleRank(userMember?.role);
-        const targetRank = roleRank(targetMember.role);
-        
-        if (targetRank >= userRank) {
-          ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_HIGHER_RANK" }));
-          return;
-        }
-        
-        let message = "";
-        
-        switch (action) {
-          case "mute":
-            const muteMinutes = mustInt(duration, 5);
-            const muteUntil = new Date(Date.now() + muteMinutes * 60000);
-            
-            await pool.execute(
-              "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
-              [muteUntil, roomId, targetUserId]
-            );
-            
-            message = `تم كتم ${targetMember.username} لمدة ${muteMinutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`;
-            break;
-            
-          case "unmute":
-            await pool.execute(
-              "UPDATE room_members SET muted_until = NULL WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            message = `تم إلغاء كتم ${targetMember.username}`;
-            break;
-            
-          case "ban":
-            await pool.execute(
-              "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            // Remove from voice seats
-            await pool.execute(
-              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            // Disconnect user from room
-            const targetClient = clients.get(targetUserId);
-            if (targetClient) {
-              targetClient.ws.send(JSON.stringify({
-                type: "banned",
-                room_id: roomId,
-                reason: reason || ""
-              }));
-              
-              // Remove from room tracking
-              targetClient.rooms.delete(roomId);
-            }
-            
-            message = `تم حظر ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
-            break;
-            
-          case "unban":
-            await pool.execute(
-              "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            message = `تم إلغاء حظر ${targetMember.username}`;
-            break;
-            
-          case "kick":
-            // Remove from voice seats
-            await pool.execute(
-              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            // Disconnect user from room
-            const targetClient2 = clients.get(targetUserId);
-            if (targetClient2) {
-              targetClient2.ws.send(JSON.stringify({
-                type: "kicked",
-                room_id: roomId,
-                reason: reason || ""
-              }));
-              
-              // Remove from room tracking
-              targetClient2.rooms.delete(roomId);
-            }
-            
-            message = `تم طرد ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
-            break;
-            
-          case "promote":
-            await pool.execute(
-              "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            message = `تم ترقية ${targetMember.username} إلى مشرف`;
-            break;
-            
-          case "demote":
-            await pool.execute(
-              "UPDATE room_members SET role = 'member' WHERE room_id = ? AND user_id = ?",
-              [roomId, targetUserId]
-            );
-            
-            message = `تم خفض رتبة ${targetMember.username} إلى عضو`;
-            break;
-        }
-        
-        // Add system message
-        if (message) {
-          await pool.execute(
-            "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-            [roomId, message]
-          );
+        const targetClient2 = clients.get(targetUserId);
+        if (targetClient2) {
+          targetClient2.ws.send(JSON.stringify({
+            type: "kicked",
+            room_id: roomId,
+            reason: reason || ""
+          }));
           
-          const systemMessage = await dbOne(`
-            SELECT * FROM messages 
-            WHERE room_id = ? 
-            ORDER BY id DESC 
-            LIMIT 1
-          `, [roomId]);
-          
-          broadcastToRoom(roomId, {
-            type: "chat",
-            message: systemMessage
-          });
+          targetClient2.rooms.delete(roomId);
         }
         
-        // Update member list
-        const members = await dbAll(`
-          SELECT rm.*, 
-                 u.username, 
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified
-          FROM room_members rm
-          LEFT JOIN users u ON rm.user_id = u.id
-          WHERE rm.room_id = ? AND rm.is_banned = FALSE
-        `, [roomId]);
+        message = `تم طرد ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
+        break;
         
-        broadcastToRoom(roomId, {
-          type: "members_update",
-          members: members.map(m => ({
-            user_id: m.user_id,
-            username: m.username,
-            avatar_url: m.avatar_url,
-            role: m.role,
-            muted_until: m.muted_until,
-            label_text: m.label_text,
-            label_color: m.label_color,
-            is_developer: m.is_developer,
-            verified: m.verified
-          }))
-        });
-      }
-      
-      async function handleSetLabel(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, target_user_id, label_text, label_color } = data;
-        const roomId = mustInt(room_id);
-        const targetUserId = mustInt(target_user_id);
-        
-        if (!roomId || !targetUserId) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check permissions
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Update label
-        await pool.execute(
-          "UPDATE room_members SET label_text = ?, label_color = ? WHERE room_id = ? AND user_id = ?",
-          [label_text || null, label_color || "#007AFF", roomId, targetUserId]
-        );
-        
-        // Get updated member
-        const member = await dbOne(`
-          SELECT rm.*, 
-                 u.username, 
-                 u.avatar_url,
-                 u.is_developer,
-                 u.verified
-          FROM room_members rm
-          LEFT JOIN users u ON rm.user_id = u.id
-          WHERE rm.room_id = ? AND rm.user_id = ?
-        `, [roomId, targetUserId]);
-        
-        broadcastToRoom(roomId, {
-          type: "member_update",
-          member: {
-            user_id: member.user_id,
-            username: member.username,
-            avatar_url: member.avatar_url,
-            role: member.role,
-            muted_until: member.muted_until,
-            label_text: member.label_text,
-            label_color: member.label_color,
-            is_developer: member.is_developer,
-            verified: member.verified
-          }
-        });
-      }
-      
-      async function handleTransferOwner(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, new_owner_id } = data;
-        const roomId = mustInt(room_id);
-        const newOwnerId = mustInt(new_owner_id);
-        
-        if (!roomId || !newOwnerId) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check if user is room owner
-        const isOwner = await isRoomOwner(roomId, userId);
-        if (!isOwner) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Check if new owner is room member
-        const newOwnerMember = await getRoomMember(roomId, newOwnerId);
-        if (!newOwnerMember) {
-          ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
-          return;
-        }
-        
-        // Transfer ownership
-        await pool.execute(
-          "UPDATE rooms SET owner_id = ? WHERE id = ?",
-          [newOwnerId, roomId]
-        );
-        
-        await pool.execute(
-          "UPDATE room_members SET role = 'owner' WHERE room_id = ? AND user_id = ?",
-          [roomId, newOwnerId]
-        );
-        
+      case "promote":
         await pool.execute(
           "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
-          [roomId, userId]
+          [roomId, targetUserId]
         );
         
-        // Add system message
+        message = `تم ترقية ${targetMember.username} إلى مشرف`;
+        break;
+        
+      case "demote":
         await pool.execute(
-          "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-          [roomId, `تم نقل ملكية الغرفة إلى ${newOwnerMember.username}`]
+          "UPDATE room_members SET role = 'member' WHERE room_id = ? AND user_id = ?",
+          [roomId, targetUserId]
         );
         
-        broadcastToRoom(roomId, {
-          type: "owner_transferred",
-          old_owner_id: userId,
-          new_owner_id: newOwnerId
-        });
-      }
+        message = `تم خفض رتبة ${targetMember.username} إلى عضو`;
+        break;
+    }
+    
+    if (message) {
+      await pool.execute(
+        "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+        [roomId, message]
+      );
       
-      async function handleSeatJoin(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, seat_index } = data;
-        const roomId = mustInt(room_id);
-        const seatIndex = mustInt(seat_index);
-        
-        if (!roomId || !seatIndex) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check if user is room member
-        const isMember = await dbOne(
-          "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
-          [roomId, userId]
-        );
-        
-        if (!isMember) {
-          ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
-          return;
-        }
-        
-        // Check if room is voice room
-        const room = await dbOne("SELECT type FROM rooms WHERE id = ?", [roomId]);
-        if (!room || room.type !== "voice") {
-          ws.send(JSON.stringify({ type: "error", error: "NOT_VOICE_ROOM" }));
-          return;
-        }
-        
-        // Check if seat exists and is available
-        const seat = await dbOne(
-          "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
-          [roomId, seatIndex]
-        );
-        
-        if (!seat) {
-          ws.send(JSON.stringify({ type: "error", error: "SEAT_NOT_FOUND" }));
-          return;
-        }
-        
-        if (seat.user_id !== null && seat.user_id !== userId) {
-          ws.send(JSON.stringify({ type: "error", error: "SEAT_OCCUPIED" }));
-          return;
-        }
-        
-        if (seat.is_locked) {
-          ws.send(JSON.stringify({ type: "error", error: "SEAT_LOCKED" }));
-          return;
-        }
-        
-        // Remove user from any other seat
-        await pool.execute(
-          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-          [roomId, userId]
-        );
-        
-        // Occupy seat
-        await pool.execute(
-          "UPDATE voice_seats SET user_id = ? WHERE room_id = ? AND seat_index = ?",
-          [userId, roomId, seatIndex]
-        );
-        
-        // Get updated seats
-        const seats = await dbAll(
-          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-          [roomId]
-        );
-        
-        broadcastToRoom(roomId, {
-          type: "seats_update",
-          seats
-        });
-      }
+      const systemMessage = await dbOne(`
+        SELECT * FROM messages 
+        WHERE room_id = ? 
+        ORDER BY id DESC 
+        LIMIT 1
+      `, [roomId]);
       
-      async function handleSeatLeave(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, seat_index } = data;
-        const roomId = mustInt(room_id);
-        const seatIndex = mustInt(seat_index);
-        
-        if (!roomId) return;
-        
-        if (seatIndex) {
-          // Leave specific seat
-          await pool.execute(
-            "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ? AND user_id = ?",
-            [roomId, seatIndex, userId]
-          );
-        } else {
-          // Leave all seats
-          await pool.execute(
-            "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-            [roomId, userId]
-          );
-        }
-        
-        // Get updated seats
-        const seats = await dbAll(
-          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-          [roomId]
-        );
-        
-        broadcastToRoom(roomId, {
-          type: "seats_update",
-          seats
-        });
+      broadcastToRoom(roomId, {
+        type: "chat",
+        message: systemMessage
+      });
+    }
+    
+    const members = await dbAll(`
+      SELECT rm.*, 
+             u.username, 
+             u.avatar_url,
+             u.is_developer,
+             u.verified
+      FROM room_members rm
+      LEFT JOIN users u ON rm.user_id = u.id
+      WHERE rm.room_id = ? AND rm.is_banned = FALSE
+    `, [roomId]);
+    
+    broadcastToRoom(roomId, {
+      type: "members_update",
+      members: members.map(m => ({
+        user_id: m.user_id,
+        username: m.username,
+        avatar_url: m.avatar_url,
+        role: m.role,
+        muted_until: m.muted_until,
+        label_text: m.label_text,
+        label_color: m.label_color,
+        is_developer: m.is_developer,
+        verified: m.verified
+      }))
+    });
+  }
+  
+  async function handleSetLabel(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, target_user_id, label_text, label_color } = data;
+    const roomId = mustInt(room_id);
+    const targetUserId = mustInt(target_user_id);
+    
+    if (!roomId || !targetUserId) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const canModerate = await canModerateRoom(roomId, userId);
+    if (!canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE room_members SET label_text = ?, label_color = ? WHERE room_id = ? AND user_id = ?",
+      [label_text || null, label_color || "#007AFF", roomId, targetUserId]
+    );
+    
+    const member = await dbOne(`
+      SELECT rm.*, 
+             u.username, 
+             u.avatar_url,
+             u.is_developer,
+             u.verified
+      FROM room_members rm
+      LEFT JOIN users u ON rm.user_id = u.id
+      WHERE rm.room_id = ? AND rm.user_id = ?
+    `, [roomId, targetUserId]);
+    
+    broadcastToRoom(roomId, {
+      type: "member_update",
+      member: {
+        user_id: member.user_id,
+        username: member.username,
+        avatar_url: member.avatar_url,
+        role: member.role,
+        muted_until: member.muted_until,
+        label_text: member.label_text,
+        label_color: member.label_color,
+        is_developer: member.is_developer,
+        verified: member.verified
       }
+    });
+  }
+  
+  async function handleTransferOwner(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, new_owner_id } = data;
+    const roomId = mustInt(room_id);
+    const newOwnerId = mustInt(new_owner_id);
+    
+    if (!roomId || !newOwnerId) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const isOwner = await isRoomOwner(roomId, userId);
+    if (!isOwner) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    const newOwnerMember = await getRoomMember(roomId, newOwnerId);
+    if (!newOwnerMember) {
+      ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE rooms SET owner_id = ? WHERE id = ?",
+      [newOwnerId, roomId]
+    );
+    
+    await pool.execute(
+      "UPDATE room_members SET role = 'owner' WHERE room_id = ? AND user_id = ?",
+      [roomId, newOwnerId]
+    );
+    
+    await pool.execute(
+      "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
+      [roomId, userId]
+    );
+    
+    await pool.execute(
+      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+      [roomId, `تم نقل ملكية الغرفة إلى ${newOwnerMember.username}`]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "owner_transferred",
+      old_owner_id: userId,
+      new_owner_id: newOwnerId
+    });
+  }
+  
+  async function handleSeatJoin(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, seat_index } = data;
+    const roomId = mustInt(room_id);
+    const seatIndex = mustInt(seat_index);
+    
+    if (!roomId || !seatIndex) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const isMember = await dbOne(
+      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+      [roomId, userId]
+    );
+    
+    if (!isMember) {
+      ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
+      return;
+    }
+    
+    const room = await dbOne("SELECT type FROM rooms WHERE id = ?", [roomId]);
+    if (!room || room.type !== "voice") {
+      ws.send(JSON.stringify({ type: "error", error: "NOT_VOICE_ROOM" }));
+      return;
+    }
+    
+    const seat = await dbOne(
+      "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+      [roomId, seatIndex]
+    );
+    
+    if (!seat) {
+      ws.send(JSON.stringify({ type: "error", error: "SEAT_NOT_FOUND" }));
+      return;
+    }
+    
+    if (seat.user_id !== null && seat.user_id !== userId) {
+      ws.send(JSON.stringify({ type: "error", error: "SEAT_OCCUPIED" }));
+      return;
+    }
+    
+    if (seat.is_locked) {
+      ws.send(JSON.stringify({ type: "error", error: "SEAT_LOCKED" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+      [roomId, userId]
+    );
+    
+    await pool.execute(
+      "UPDATE voice_seats SET user_id = ? WHERE room_id = ? AND seat_index = ?",
+      [userId, roomId, seatIndex]
+    );
+    
+    const seats = await dbAll(
+      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "seats_update",
+      seats
+    });
+  }
+  
+  async function handleSeatLeave(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, seat_index } = data;
+    const roomId = mustInt(room_id);
+    const seatIndex = mustInt(seat_index);
+    
+    if (!roomId) return;
+    
+    if (seatIndex) {
+      await pool.execute(
+        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ? AND user_id = ?",
+        [roomId, seatIndex, userId]
+      );
+    } else {
+      await pool.execute(
+        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+        [roomId, userId]
+      );
+    }
+    
+    const seats = await dbAll(
+      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "seats_update",
+      seats
+    });
+  }
+  
+  async function handleSeatKick(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, seat_index } = data;
+    const roomId = mustInt(room_id);
+    const seatIndex = mustInt(seat_index);
+    
+    if (!roomId || !seatIndex) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const canModerate = await canModerateRoom(roomId, userId);
+    if (!canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    const seat = await dbOne(
+      "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+      [roomId, seatIndex]
+    );
+    
+    if (!seat || !seat.user_id) {
+      ws.send(JSON.stringify({ type: "error", error: "SEAT_EMPTY" }));
+      return;
+    }
+    
+    await pool.execute(
+      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
+      [roomId, seatIndex]
+    );
+    
+    sendToUser(seat.user_id, {
+      type: "seat_kicked",
+      room_id: roomId,
+      seat_index: seatIndex
+    });
+    
+    const seats = await dbAll(
+      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "seats_update",
+      seats
+    });
+  }
+  
+  async function handleSeatLock(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, seat_index } = data;
+    const roomId = mustInt(room_id);
+    const seatIndex = mustInt(seat_index);
+    
+    if (!roomId || !seatIndex) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
+    }
+    
+    const canModerate = await canModerateRoom(roomId, userId);
+    if (!canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    const action = data.type;
+    const isLocking = action === 'seat_lock';
+    
+    await pool.execute(
+      "UPDATE voice_seats SET is_locked = ? WHERE room_id = ? AND seat_index = ?",
+      [isLocking ? 1 : 0, roomId, seatIndex]
+    );
+    
+    if (isLocking) {
+      const seat = await dbOne(
+        "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
+        [roomId, seatIndex]
+      );
       
-      async function handleSeatKick(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, seat_index } = data;
-        const roomId = mustInt(room_id);
-        const seatIndex = mustInt(seat_index);
-        
-        if (!roomId || !seatIndex) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check permissions
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        // Get seat
-        const seat = await dbOne(
-          "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
-          [roomId, seatIndex]
-        );
-        
-        if (!seat || !seat.user_id) {
-          ws.send(JSON.stringify({ type: "error", error: "SEAT_EMPTY" }));
-          return;
-        }
-        
-        // Kick user from seat
+      if (seat && seat.user_id) {
         await pool.execute(
           "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
           [roomId, seatIndex]
         );
         
-        // Notify kicked user
         sendToUser(seat.user_id, {
-          type: "seat_kicked",
+          type: "seat_locked_kick",
           room_id: roomId,
           seat_index: seatIndex
         });
-        
-        // Get updated seats
-        const seats = await dbAll(
-          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-          [roomId]
-        );
-        
-        broadcastToRoom(roomId, {
-          type: "seats_update",
-          seats
-        });
       }
-      
-      async function handleSeatLock(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, seat_index } = data;
-        const roomId = mustInt(room_id);
-        const seatIndex = mustInt(seat_index);
-        
-        if (!roomId || !seatIndex) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check permissions
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        const action = data.type; // 'seat_lock' or 'seat_unlock'
-        const isLocking = action === 'seat_lock';
-        
-        // Update seat lock status
-        await pool.execute(
-          "UPDATE voice_seats SET is_locked = ? WHERE room_id = ? AND seat_index = ?",
-          [isLocking ? 1 : 0, roomId, seatIndex]
-        );
-        
-        // If locking and seat is occupied, kick user
-        if (isLocking) {
-          const seat = await dbOne(
-            "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
-            [roomId, seatIndex]
-          );
-          
-          if (seat && seat.user_id) {
-            await pool.execute(
-              "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
-              [roomId, seatIndex]
-            );
-            
-            // Notify kicked user
-            sendToUser(seat.user_id, {
-              type: "seat_locked_kick",
-              room_id: roomId,
-              seat_index: seatIndex
-            });
-          }
-        }
-        
-        // Get updated seats
-        const seats = await dbAll(
-          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-          [roomId]
-        );
-        
-        broadcastToRoom(roomId, {
-          type: "seats_update",
-          seats
-        });
-      }
-      
-      async function handleSeatMute(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, seat_index } = data;
-        const roomId = mustInt(room_id);
-        const seatIndex = mustInt(seat_index);
-        
-        if (!roomId || !seatIndex) {
-          ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-          return;
-        }
-        
-        // Check permissions
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-          return;
-        }
-        
-        const action = data.type; // 'seat_mute' or 'seat_unmute'
-        const isMuting = action === 'seat_mute';
-        
-        // Update seat mute status
-        await pool.execute(
-          "UPDATE voice_seats SET is_muted = ? WHERE room_id = ? AND seat_index = ?",
-          [isMuting ? 1 : 0, roomId, seatIndex]
-        );
-        
-        // Get updated seats
-        const seats = await dbAll(
-          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-          [roomId]
-        );
-        
-        broadcastToRoom(roomId, {
-          type: "seats_update",
-          seats
-        });
-      }
-      
-      async function handleWebRTCSignal(ws, data, userId) {
-        if (!userId) return;
-        
-        const { room_id, target_user_id, signal } = data;
-        const roomId = mustInt(room_id);
-        const targetUserId = mustInt(target_user_id);
-        
-        if (!roomId || !targetUserId || !signal) return;
-        
-        // Forward signal to target user
-        sendToUser(targetUserId, {
-          type: data.type,
-          from_user_id: userId,
-          signal: signal
-        });
-      }
-    });
-    
-    // Send initial welcome
-    ws.send(JSON.stringify({
-      type: "welcome",
-      message: "Connected to ProfileHub WebSocket server"
-    }));
-  });
-  
-  // ================== HELPER FUNCTIONS ==================
-  async function cleanupOldMessages(roomId, limit) {
-    try {
-      const messages = await dbAll(`
-        SELECT id FROM messages 
-        WHERE room_id = ? AND deleted = FALSE 
-        ORDER BY id DESC 
-        LIMIT 18446744073709551615 OFFSET ?
-      `, [roomId, limit]);
-      
-      if (messages.length > 0) {
-        const ids = messages.map(m => m.id);
-        await pool.execute(
-          "UPDATE messages SET deleted = TRUE WHERE id IN (?)",
-          [ids]
-        );
-      }
-    } catch (error) {
-      console.error("Cleanup messages error:", error);
-    }
-  }
-  
-  // ================== START SERVER ==================
-  async function startServer() {
-    const dbInitialized = await initializeDatabase();
-    
-    if (!dbInitialized) {
-      console.error("❌ Failed to initialize database. Exiting...");
-      process.exit(1);
     }
     
-    server.listen(PORT, () => {
-      console.log(`✅ Server running on port ${PORT}`);
-      console.log(`🌐 WebSocket server ready`);
-      console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
+    const seats = await dbAll(
+      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "seats_update",
+      seats
     });
   }
   
-  // Handle graceful shutdown
-  process.on("SIGINT", async () => {
-    console.log("Shutting down gracefully...");
+  async function handleSeatMute(ws, data, userId) {
+    if (!userId) return;
     
-    if (pool) {
-      await pool.end();
+    const { room_id, seat_index } = data;
+    const roomId = mustInt(room_id);
+    const seatIndex = mustInt(seat_index);
+    
+    if (!roomId || !seatIndex) {
+      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
+      return;
     }
     
-    wss.close(() => {
-      console.log("WebSocket server closed");
-      process.exit(0);
+    const canModerate = await canModerateRoom(roomId, userId);
+    if (!canModerate) {
+      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
+      return;
+    }
+    
+    const action = data.type;
+    const isMuting = action === 'seat_mute';
+    
+    await pool.execute(
+      "UPDATE voice_seats SET is_muted = ? WHERE room_id = ? AND seat_index = ?",
+      [isMuting ? 1 : 0, roomId, seatIndex]
+    );
+    
+    const seats = await dbAll(
+      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      [roomId]
+    );
+    
+    broadcastToRoom(roomId, {
+      type: "seats_update",
+      seats
     });
-  });
-  
-  // ================== ERROR HANDLING ==================
-  app.use((err, req, res, next) => {
-    console.error("Unhandled error:", err);
-    res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
-  });
-  
-  // 404 handler
-  app.use((req, res) => {
-    res.status(404).json({ error: "NOT_FOUND" });
-  });
-  
-  // ================== EXPORT FOR TESTING ==================
-  if (require.main === module) {
-    startServer();
-  } else {
-    module.exports = {
-      app,
-      server,
-      wss,
-      pool,
-      initializeDatabase,
-      startServer
-    };
   }
+  
+  async function handleWebRTCSignal(ws, data, userId) {
+    if (!userId) return;
+    
+    const { room_id, target_user_id, signal } = data;
+    const roomId = mustInt(room_id);
+    const targetUserId = mustInt(target_user_id);
+    
+    if (!roomId || !targetUserId || !signal) return;
+    
+    sendToUser(targetUserId, {
+      type: data.type,
+      from_user_id: userId,
+      signal: signal
+    });
+  }
+  
+  ws.send(JSON.stringify({
+    type: "welcome",
+    message: "Connected to ProfileHub WebSocket server"
+  }));
 });
 
-// إذا كان الملف يتم تشغيله مباشرة
-if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
+// ================== ERROR HANDLING ==================
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "NOT_FOUND" });
+});
+
+// ================== START SERVER ==================
+async function startServer() {
+  const dbInitialized = await initializeDatabase();
   
-  initializeDatabase().then(dbInitialized => {
-    if (!dbInitialized) {
-      console.error("❌ Failed to initialize database. Exiting...");
-      process.exit(1);
-    }
-    
-    server.listen(PORT, () => {
-      console.log(`✅ Server running on port ${PORT}`);
-      console.log(`🌐 WebSocket server ready`);
-      console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
-    });
+  if (!dbInitialized) {
+    console.error("❌ Failed to initialize database. Exiting...");
+    process.exit(1);
+  }
+  
+  server.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🌐 WebSocket server ready`);
+    console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
   });
+}
+
+// Handle graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
+  
+  if (pool) {
+    await pool.end();
+  }
+  
+  wss.close(() => {
+    console.log("WebSocket server closed");
+    process.exit(0);
+  });
+});
+
+// Start the server
+if (require.main === module) {
+  startServer();
 }
