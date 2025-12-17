@@ -27,17 +27,103 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 // ================== DATABASE CONFIGURATION ==================
-const DB_CONFIG = {
-  host: process.env.MYSQLHOST || "localhost",
-  port: process.env.MYSQLPORT || 3306,
-  user: process.env.MYSQLUSER || "root",
-  password: process.env.MYSQLPASSWORD || "",
-  database: process.env.MYSQLDATABASE || "profilehub",
-  waitForConnections: true,
-  connectionLimit: 20,
-  queueLimit: 0,
-  ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : false,
+// تلقائي من متغيرات البيئة في Railway
+const parseDatabaseUrl = (url) => {
+  if (!url) return null;
+  
+  try {
+    // تنسيق: mysql://user:password@host:port/database
+    const match = url.match(/mysql:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/(.+)/);
+    if (match) {
+      return {
+        host: match[3],
+        port: parseInt(match[4]),
+        user: match[1],
+        password: match[2],
+        database: match[5]
+      };
+    }
+  } catch (error) {
+    console.error("Error parsing MYSQL_PUBLIC_URL:", error);
+  }
+  return null;
 };
+
+// محاولة الحصول على إعدادات قاعدة البيانات تلقائيًا
+const getDatabaseConfig = () => {
+  // أولوية: MYSQL_PUBLIC_URL (Railway)
+  const publicUrl = process.env.MYSQL_PUBLIC_URL;
+  if (publicUrl) {
+    const parsed = parseDatabaseUrl(publicUrl);
+    if (parsed) {
+      console.log("🔗 Using MYSQL_PUBLIC_URL configuration");
+      return {
+        ...parsed,
+        waitForConnections: true,
+        connectionLimit: 20,
+        queueLimit: 0,
+        ssl: { rejectUnauthorized: false }
+      };
+    }
+  }
+  
+  // ثانيًا: إعدادات MySQL المنفصلة
+  if (process.env.MYSQLHOST) {
+    console.log("🔗 Using MYSQLHOST configuration");
+    return {
+      host: process.env.MYSQLHOST,
+      port: parseInt(process.env.MYSQLPORT) || 3306,
+      user: process.env.MYSQLUSER,
+      password: process.env.MYSQLPASSWORD,
+      database: process.env.MYSQLDATABASE || "railway",
+      waitForConnections: true,
+      connectionLimit: 20,
+      queueLimit: 0,
+      ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : false,
+    };
+  }
+  
+  // ثالثًا: DATABASE_URL (Render, Heroku)
+  const databaseUrl = process.env.DATABASE_URL;
+  if (databaseUrl && databaseUrl.includes("mysql://")) {
+    const parsed = parseDatabaseUrl(databaseUrl);
+    if (parsed) {
+      console.log("🔗 Using DATABASE_URL configuration");
+      return {
+        ...parsed,
+        waitForConnections: true,
+        connectionLimit: 20,
+        queueLimit: 0,
+        ssl: { rejectUnauthorized: false }
+      };
+    }
+  }
+  
+  // أخيرًا: إعدادات محلية افتراضية
+  console.log("🔗 Using local configuration");
+  return {
+    host: "localhost",
+    port: 3306,
+    user: "root",
+    password: "",
+    database: "profilehub",
+    waitForConnections: true,
+    connectionLimit: 20,
+    queueLimit: 0,
+    ssl: false,
+  };
+};
+
+const DB_CONFIG = getDatabaseConfig();
+
+// طباعة إعدادات قاعدة البيانات (بدون كلمة المرور)
+console.log("📊 Database Configuration:", {
+  host: DB_CONFIG.host,
+  port: DB_CONFIG.port,
+  user: DB_CONFIG.user,
+  database: DB_CONFIG.database,
+  hasPassword: !!DB_CONFIG.password
+});
 
 let pool;
 let JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString("hex");
@@ -179,20 +265,52 @@ async function isRoomOwner(roomId, userId) {
 // ================== DATABASE INITIALIZATION ==================
 async function initializeDatabase() {
   try {
+    console.log("🔄 Attempting to connect to database...");
+    
+    // محاولة الاتصال بقاعدة البيانات
     pool = await mysql.createPool(DB_CONFIG);
+    
+    // اختبار الاتصال
+    await pool.execute("SELECT 1");
     console.log("✅ Database connected successfully");
     
+    // إنشاء الجداول
     await createTables();
+    
+    // إنشاء المستخدم الافتراضي
     await createDefaultAdmin();
     
     return true;
   } catch (error) {
-    console.error("❌ Database initialization failed:", error);
+    console.error("❌ Database initialization failed:");
+    console.error("Error message:", error.message);
+    console.error("Error code:", error.code);
+    
+    // إذا فشل الاتصال، جرب الاتصال بدون SSL
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED') {
+      console.log("🔄 Retrying without SSL...");
+      try {
+        const configWithoutSSL = { ...DB_CONFIG, ssl: false };
+        pool = await mysql.createPool(configWithoutSSL);
+        await pool.execute("SELECT 1");
+        console.log("✅ Connected without SSL");
+        
+        await createTables();
+        await createDefaultAdmin();
+        
+        return true;
+      } catch (retryError) {
+        console.error("❌ Retry also failed:", retryError.message);
+      }
+    }
+    
     return false;
   }
 }
 
 async function createTables() {
+  console.log("📝 Creating tables...");
+  
   const tables = [
     `CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -406,45 +524,53 @@ async function createTables() {
     )`,
   ];
   
+  let createdCount = 0;
   for (const tableSql of tables) {
     try {
       await pool.execute(tableSql);
+      createdCount++;
     } catch (error) {
       console.error("Error creating table:", error.message);
     }
   }
   
-  console.log("✅ All tables created successfully");
+  console.log(`✅ ${createdCount} tables created successfully`);
 }
 
 async function createDefaultAdmin() {
-  const adminExists = await dbOne("SELECT id FROM users WHERE username = ?", ["admin"]);
-  
-  if (!adminExists) {
-    const adminPassword = await hashPassword("admin123");
-    const referralCode = crypto.randomBytes(8).toString("hex").toUpperCase();
+  try {
+    const adminExists = await dbOne("SELECT id FROM users WHERE username = ?", ["admin"]);
     
-    await pool.execute(
-      `INSERT INTO users (username, email, password_hash, is_developer, verified, points, avatar_url, bio, referral_code, settings_json) 
-       VALUES (?, ?, ?, TRUE, TRUE, 10000, ?, ?, ?, ?)`,
-      [
-        "admin",
-        "admin@profilehub.com",
-        adminPassword,
-        "https://ui-avatars.com/api/?name=Admin&background=007AFF&color=fff&size=150",
-        "مدير النظام - يمكنني مساعدتك في أي شيء",
-        referralCode,
-        JSON.stringify({
-          theme: "auto",
-          language: "ar",
-          notifications: true,
-          sound: true,
-          privacy: "public"
-        })
-      ]
-    );
-    
-    console.log("✅ Default admin user created");
+    if (!adminExists) {
+      const adminPassword = await hashPassword("admin123");
+      const referralCode = crypto.randomBytes(8).toString("hex").toUpperCase();
+      
+      await pool.execute(
+        `INSERT INTO users (username, email, password_hash, is_developer, verified, points, avatar_url, bio, referral_code, settings_json) 
+         VALUES (?, ?, ?, TRUE, TRUE, 10000, ?, ?, ?, ?)`,
+        [
+          "admin",
+          "admin@profilehub.com",
+          adminPassword,
+          "https://ui-avatars.com/api/?name=Admin&background=007AFF&color=fff&size=150",
+          "مدير النظام - يمكنني مساعدتك في أي شيء",
+          referralCode,
+          JSON.stringify({
+            theme: "auto",
+            language: "ar",
+            notifications: true,
+            sound: true,
+            privacy: "public"
+          })
+        ]
+      );
+      
+      console.log("✅ Default admin user created");
+    } else {
+      console.log("ℹ️ Admin user already exists");
+    }
+  } catch (error) {
+    console.error("❌ Error creating admin:", error.message);
   }
 }
 
@@ -456,7 +582,8 @@ app.get("/", (req, res) => {
     status: "online",
     name: "ProfileHub API",
     version: "2.0.0",
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    database: pool ? "connected" : "disconnected"
   });
 });
 
@@ -2517,17 +2644,25 @@ app.use((req, res) => {
 
 // ================== START SERVER ==================
 async function startServer() {
+  console.log("🚀 Starting ProfileHub Server...");
+  console.log("📊 Environment:", {
+    port: PORT,
+    node_env: process.env.NODE_ENV
+  });
+  
   const dbInitialized = await initializeDatabase();
   
   if (!dbInitialized) {
-    console.error("❌ Failed to initialize database. Exiting...");
-    process.exit(1);
+    console.error("❌ Failed to initialize database. Starting in limited mode...");
+    // يمكنك اختيار الاستمرار بدون قاعدة بيانات أو الخروج
   }
   
   server.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`🌐 Socket.IO server ready`);
-    console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
+    console.log(`📊 Database: ${dbInitialized ? "connected" : "disconnected"}`);
+    console.log(`🔗 API available at: http://localhost:${PORT}/`);
+    console.log(`🔐 Login endpoint: POST http://localhost:${PORT}/api/login`);
   });
 }
 
