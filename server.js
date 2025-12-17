@@ -1,6 +1,7 @@
 /**
- * ProfileHub Server - Complete v3.0
- * Full-featured chat application with profiles, frames, voice rooms, moderation, bots, and more
+ * ProfileHub Server - Complete v4.0
+ * Full-featured chat application compatible with t.html frontend
+ * Complete server file with all features
  */
 
 require('dotenv').config();
@@ -29,7 +30,7 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ================== IN-MEMORY DATABASE (Replace with real DB for production) ==================
+// ================== IN-MEMORY DATABASE ==================
 let users = [];
 let rooms = [];
 let frames = [];
@@ -368,45 +369,41 @@ function initializeDefaultData() {
                 created_at: new Date().toISOString()
             }
         ];
+        console.log('✅ Created 3 subscription plans');
     }
 
-    // Create payment methods
+    // Create default payment methods
     if (paymentMethods.length === 0) {
         paymentMethods = [
             {
                 id: 1,
-                method_key: 'stripe',
                 name: 'بطاقة ائتمان',
-                description: 'دفع آمن عبر Stripe',
+                provider: 'stripe',
+                icon: '💳',
                 is_active: true,
-                config_json: JSON.stringify({
-                    public_key: process.env.STRIPE_PUBLIC_KEY || '',
-                    currency: 'usd'
-                }),
+                config_json: JSON.stringify({}),
                 created_at: new Date().toISOString()
             },
             {
                 id: 2,
-                method_key: 'points',
                 name: 'النقاط',
-                description: 'استخدام النقاط المتوفرة',
+                provider: 'points',
+                icon: '💰',
                 is_active: true,
                 config_json: JSON.stringify({}),
                 created_at: new Date().toISOString()
             },
             {
                 id: 3,
-                method_key: 'paypal',
                 name: 'PayPal',
-                description: 'دفع عبر PayPal',
+                provider: 'paypal',
+                icon: '👛',
                 is_active: true,
-                config_json: JSON.stringify({
-                    client_id: process.env.PAYPAL_CLIENT_ID || '',
-                    currency: 'USD'
-                }),
+                config_json: JSON.stringify({}),
                 created_at: new Date().toISOString()
             }
         ];
+        console.log('✅ Created 3 payment methods');
     }
 
     console.log('✅ Default data initialization completed');
@@ -517,7 +514,7 @@ app.get('/', (req, res) => {
     res.json({
         ok: true,
         name: 'ProfileHub API',
-        version: '3.0.0',
+        version: '4.0.0',
         timestamp: new Date().toISOString(),
         features: [
             'User Profiles',
@@ -550,13 +547,7 @@ app.get('/', (req, res) => {
             'POST   /api/rooms/:id/autodelete',
             'GET    /api/rooms/:id/bots',
             'POST   /api/bots',
-            'POST   /api/bots/:id/commands',
-            'GET    /api/subscriptions',
-            'GET    /api/payment-methods',
-            'POST   /api/subscriptions/subscribe',
-            'GET    /api/admin/users',
-            'POST   /api/admin/users/:id/toggle-ban',
-            'POST   /api/admin/users/:id/toggle-verify'
+            'POST   /api/bots/:id/commands'
         ]
     });
 });
@@ -574,7 +565,7 @@ app.get('/health', (req, res) => {
 // ===== Authentication =====
 app.post('/api/register', async (req, res) => {
     try {
-        const { username, email, password, referral_code } = req.body;
+        const { username, email, password } = req.body;
         
         // Validation
         if (!username || !email || !password) {
@@ -601,31 +592,6 @@ app.post('/api/register', async (req, res) => {
         // Generate referral code
         const userReferralCode = crypto.randomBytes(6).toString('hex').toUpperCase();
         
-        // Handle referral bonus
-        let referredBy = null;
-        let bonusPoints = 0;
-        
-        if (referral_code) {
-            const referrer = users.find(u => u.referral_code === referral_code);
-            if (referrer) {
-                referredBy = referrer.id;
-                bonusPoints = 1000;
-                
-                // Give points to referrer
-                referrer.points += 500;
-                
-                // Record transaction
-                pointTransactions.push({
-                    id: pointTransactions.length + 1,
-                    from_user_id: null,
-                    to_user_id: referrer.id,
-                    amount: 500,
-                    reason: `إحالة: ${username}`,
-                    created_at: nowIso()
-                });
-            }
-        }
-        
         // Create new user
         const newUser = {
             id: users.length + 1,
@@ -634,13 +600,12 @@ app.post('/api/register', async (req, res) => {
             password_hash: passwordHash,
             avatar_url: `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=007AFF&color=fff&size=150`,
             bio: `مرحباً بكم! أنا ${username} 👋`,
-            points: 100 + bonusPoints,
+            points: 100,
             verified: false,
             is_developer: false,
             banned: false,
             frame_id: 1, // Default frame
             referral_code: userReferralCode,
-            referred_by: referredBy,
             settings_json: JSON.stringify({
                 theme: 'auto',
                 language: 'ar',
@@ -664,18 +629,6 @@ app.post('/api/register', async (req, res) => {
                 user_id: newUser.id,
                 frame_id: defaultFrame.id,
                 purchased_at: nowIso()
-            });
-        }
-        
-        // Record bonus points transaction if any
-        if (bonusPoints > 0) {
-            pointTransactions.push({
-                id: pointTransactions.length + 1,
-                from_user_id: null,
-                to_user_id: newUser.id,
-                amount: bonusPoints,
-                reason: 'مكافأة التسجيل بكود دعوة',
-                created_at: nowIso()
             });
         }
         
@@ -757,16 +710,10 @@ app.get('/api/profile', authMiddleware, (req, res) => {
             .map(uf => frames.find(f => f.id === uf.frame_id))
             .filter(Boolean);
         
-        // Get user subscription if any
-        const userSubscription = userSubscriptions.find(us => 
-            us.user_id === req.user.id && us.status === 'active'
-        );
-        
         res.json({
             ok: true,
             user: userResponse,
-            owned_frames: ownedFrames,
-            subscription: userSubscription || null
+            owned_frames: ownedFrames
         });
         
     } catch (error) {
@@ -1163,67 +1110,6 @@ app.get('/api/frames', authMiddleware, (req, res) => {
     }
 });
 
-app.post('/api/frames/purchase', authMiddleware, (req, res) => {
-    try {
-        const { frame_id } = req.body;
-        
-        const frame = frames.find(f => f.id === frame_id);
-        if (!frame) {
-            return res.status(404).json({ ok: false, error: 'FRAME_NOT_FOUND' });
-        }
-        
-        // Check if already owned
-        const alreadyOwned = userFrames.find(uf => 
-            uf.user_id === req.user.id && uf.frame_id === frame_id
-        );
-        
-        if (alreadyOwned) {
-            return res.status(400).json({ ok: false, error: 'FRAME_ALREADY_OWNED' });
-        }
-        
-        // Check if available
-        if (!frame.available) {
-            return res.status(400).json({ ok: false, error: 'FRAME_NOT_AVAILABLE' });
-        }
-        
-        // Check if user has enough points
-        if (frame.price_points > req.user.points) {
-            return res.status(400).json({ ok: false, error: 'INSUFFICIENT_POINTS' });
-        }
-        
-        // Deduct points
-        req.user.points -= frame.price_points;
-        
-        // Add to user frames
-        userFrames.push({
-            id: userFrames.length + 1,
-            user_id: req.user.id,
-            frame_id: frame_id,
-            purchased_at: nowIso()
-        });
-        
-        // Record transaction
-        pointTransactions.push({
-            id: pointTransactions.length + 1,
-            from_user_id: req.user.id,
-            to_user_id: frame.created_by,
-            amount: frame.price_points,
-            reason: `Purchase frame: ${frame.name}`,
-            created_at: nowIso()
-        });
-        
-        res.json({
-            ok: true,
-            message: 'Frame purchased successfully',
-            new_balance: req.user.points
-        });
-        
-    } catch (error) {
-        console.error('Purchase frame error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
 app.post('/api/frames/select', authMiddleware, (req, res) => {
     try {
         const { frame_id } = req.body;
@@ -1253,33 +1139,16 @@ app.post('/api/frames/select', authMiddleware, (req, res) => {
 });
 
 // ===== Points System =====
-app.get('/api/points/transactions', authMiddleware, (req, res) => {
-    try {
-        const userTransactions = pointTransactions
-            .filter(pt => pt.from_user_id === req.user.id || pt.to_user_id === req.user.id)
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        
-        res.json({
-            ok: true,
-            transactions: userTransactions
-        });
-        
-    } catch (error) {
-        console.error('Get transactions error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
 app.post('/api/points/grant', authMiddleware, (req, res) => {
     try {
-        const { user_id, amount, reason } = req.body;
+        const { to_user_id, amount, reason } = req.body;
         
         // Only developers can grant points
         if (!req.user.is_developer) {
             return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
         }
         
-        const targetUser = users.find(u => u.id === user_id);
+        const targetUser = users.find(u => u.id === to_user_id);
         if (!targetUser) {
             return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND' });
         }
@@ -1291,7 +1160,7 @@ app.post('/api/points/grant', authMiddleware, (req, res) => {
         pointTransactions.push({
             id: pointTransactions.length + 1,
             from_user_id: null,
-            to_user_id: user_id,
+            to_user_id: to_user_id,
             amount: amount,
             reason: reason || `Points granted by ${req.user.username}`,
             created_at: nowIso()
@@ -1309,16 +1178,13 @@ app.post('/api/points/grant', authMiddleware, (req, res) => {
     }
 });
 
-app.post('/api/points/transfer', authMiddleware, (req, res) => {
+app.post('/api/points/deduct', authMiddleware, (req, res) => {
     try {
         const { to_user_id, amount, reason } = req.body;
         
-        if (!to_user_id || !amount || amount <= 0) {
-            return res.status(400).json({ ok: false, error: 'INVALID_PARAMETERS' });
-        }
-        
-        if (amount > req.user.points) {
-            return res.status(400).json({ ok: false, error: 'INSUFFICIENT_POINTS' });
+        // Only developers can deduct points
+        if (!req.user.is_developer) {
+            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
         }
         
         const targetUser = users.find(u => u.id === to_user_id);
@@ -1326,28 +1192,32 @@ app.post('/api/points/transfer', authMiddleware, (req, res) => {
             return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND' });
         }
         
-        // Transfer points
-        req.user.points -= amount;
-        targetUser.points += amount;
+        // Check if user has enough points
+        if (targetUser.points < amount) {
+            return res.status(400).json({ ok: false, error: 'INSUFFICIENT_POINTS' });
+        }
+        
+        // Deduct points
+        targetUser.points -= amount;
         
         // Record transaction
         pointTransactions.push({
             id: pointTransactions.length + 1,
-            from_user_id: req.user.id,
-            to_user_id: to_user_id,
+            from_user_id: to_user_id,
+            to_user_id: null,
             amount: amount,
-            reason: reason || `Points transfer from ${req.user.username}`,
+            reason: reason || `Points deducted by ${req.user.username}`,
             created_at: nowIso()
         });
         
         res.json({
             ok: true,
-            message: 'Points transferred successfully',
-            new_balance: req.user.points
+            message: 'Points deducted successfully',
+            new_balance: targetUser.points
         });
         
     } catch (error) {
-        console.error('Transfer points error:', error);
+        console.error('Deduct points error:', error);
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
@@ -1406,7 +1276,7 @@ app.post('/api/rooms/:id/mute', authMiddleware, (req, res) => {
 app.post('/api/rooms/:id/ban', authMiddleware, (req, res) => {
     try {
         const roomId = mustInt(req.params.id);
-        const { user_id, reason, permanent } = req.body;
+        const { user_id, reason } = req.body;
         
         if (!canModerateRoom(roomId, req.user.id)) {
             return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
@@ -1450,37 +1320,6 @@ app.post('/api/rooms/:id/ban', authMiddleware, (req, res) => {
     }
 });
 
-app.post('/api/rooms/:id/unban', authMiddleware, (req, res) => {
-    try {
-        const roomId = mustInt(req.params.id);
-        const { user_id } = req.body;
-        
-        if (!canModerateRoom(roomId, req.user.id)) {
-            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
-        }
-        
-        const targetMember = roomMembers.find(rm => 
-            rm.room_id === roomId && rm.user_id === user_id
-        );
-        
-        if (!targetMember) {
-            return res.status(404).json({ ok: false, error: 'USER_NOT_IN_ROOM' });
-        }
-        
-        // Unban user
-        targetMember.is_banned = false;
-        
-        res.json({
-            ok: true,
-            message: 'User unbanned successfully'
-        });
-        
-    } catch (error) {
-        console.error('Unban user error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
 app.post('/api/rooms/:id/chat-lock', authMiddleware, (req, res) => {
     try {
         const roomId = mustInt(req.params.id);
@@ -1511,14 +1350,50 @@ app.post('/api/rooms/:id/chat-lock', authMiddleware, (req, res) => {
     }
 });
 
-// ===== Bots & Commands =====
-app.get('/api/bots', authMiddleware, (req, res) => {
+app.post('/api/rooms/:id/autodelete', authMiddleware, (req, res) => {
     try {
-        const publicBots = bots.filter(bot => bot.is_public);
+        const roomId = mustInt(req.params.id);
+        const { limit } = req.body;
+        
+        if (!isRoomOwner(roomId, req.user.id)) {
+            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
+        }
+        
+        const room = rooms.find(r => r.id === roomId);
+        if (!room) {
+            return res.status(404).json({ ok: false, error: 'ROOM_NOT_FOUND' });
+        }
+        
+        const settings = safeJsonParse(room.settings_json) || {};
+        settings.auto_delete_limit = limit;
+        room.settings_json = JSON.stringify(settings);
+        room.updated_at = nowIso();
         
         res.json({
             ok: true,
-            bots: publicBots
+            message: 'Auto-delete limit updated successfully'
+        });
+        
+    } catch (error) {
+        console.error('Auto-delete error:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
+
+// ===== Bots & Commands =====
+app.get('/api/rooms/:id/bots', authMiddleware, (req, res) => {
+    try {
+        const roomId = mustInt(req.params.id);
+        
+        const roomBots = bots.filter(bot => bot.room_id === roomId);
+        const commands = botCommands.filter(cmd => 
+            roomBots.some(bot => bot.id === cmd.bot_id)
+        );
+        
+        res.json({
+            ok: true,
+            bots: roomBots,
+            commands: commands
         });
         
     } catch (error) {
@@ -1529,41 +1404,25 @@ app.get('/api/bots', authMiddleware, (req, res) => {
 
 app.post('/api/bots', authMiddleware, (req, res) => {
     try {
-        const { name, description, webhook_url, is_public, commands } = req.body;
+        const { room_id, name, avatar_url } = req.body;
         
-        // Only developers can create bots
-        if (!req.user.is_developer) {
+        // Only room owners or admins can create bots
+        const roomId = mustInt(room_id);
+        if (!canModerateRoom(roomId, req.user.id)) {
             return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
         }
         
         const newBot = {
             id: bots.length + 1,
-            name,
-            description: description || '',
-            webhook_url,
-            is_public: is_public || false,
+            room_id: roomId,
+            name: name,
+            avatar_url: avatar_url || '🤖',
             created_by: req.user.id,
             created_at: nowIso(),
             updated_at: nowIso()
         };
         
         bots.push(newBot);
-        
-        // Add commands
-        if (commands && Array.isArray(commands)) {
-            commands.forEach(cmd => {
-                botCommands.push({
-                    id: botCommands.length + 1,
-                    bot_id: newBot.id,
-                    command: cmd.command,
-                    description: cmd.description,
-                    usage: cmd.usage,
-                    requires_admin: cmd.requires_admin || false,
-                    cooldown_seconds: cmd.cooldown_seconds || 5,
-                    created_at: nowIso()
-                });
-            });
-        }
         
         res.json({
             ok: true,
@@ -1576,164 +1435,43 @@ app.post('/api/bots', authMiddleware, (req, res) => {
     }
 });
 
-app.post('/api/bots/:id/execute', authMiddleware, (req, res) => {
+app.post('/api/bots/:id/commands', authMiddleware, (req, res) => {
     try {
         const botId = mustInt(req.params.id);
-        const { command, args } = req.body;
+        const { trigger_text, response_text, match_mode } = req.body;
         
+        // Find bot
         const bot = bots.find(b => b.id === botId);
         if (!bot) {
             return res.status(404).json({ ok: false, error: 'BOT_NOT_FOUND' });
         }
         
-        // Find command
-        const botCommand = botCommands.find(bc => 
-            bc.bot_id === botId && bc.command === command
-        );
+        // Only bot owner or room admin can add commands
+        const canModerate = canModerateRoom(bot.room_id, req.user.id);
+        const isBotOwner = bot.created_by === req.user.id;
         
-        if (!botCommand) {
-            return res.status(404).json({ ok: false, error: 'COMMAND_NOT_FOUND' });
+        if (!canModerate && !isBotOwner) {
+            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
         }
         
-        // Check admin permission if required
-        if (botCommand.requires_admin && !req.user.is_developer) {
-            return res.status(403).json({ ok: false, error: 'ADMIN_REQUIRED' });
-        }
-        
-        // In a real implementation, this would call the bot's webhook
-        // For now, simulate a response
-        
-        const responses = {
-            'ping': '🏓 Pong!',
-            'help': `🤖 **${bot.name} Commands:**\n` + 
-                   botCommands.filter(bc => bc.bot_id === botId)
-                    .map(bc => `• **${bc.command}** - ${bc.description}\n  Usage: ${bc.usage}`)
-                    .join('\n'),
-            'points': `💰 لديك ${req.user.points} نقطة`,
-            'userinfo': `👤 **${req.user.username}**\n` +
-                       `📧 ${req.user.email}\n` +
-                       `🏆 النقاط: ${req.user.points}\n` +
-                       `✅ ${req.user.verified ? 'مُـتحقق' : 'غير مُتحقق'}`,
-            'time': `🕐 الوقت الحالي: ${new Date().toLocaleString('ar-SA')}`
+        const newCommand = {
+            id: botCommands.length + 1,
+            bot_id: botId,
+            trigger_text,
+            response_text,
+            match_mode: match_mode || 'exact',
+            created_at: nowIso()
         };
         
-        const response = responses[command] || `✅ تم تنفيذ الأمر: ${command}`;
+        botCommands.push(newCommand);
         
         res.json({
             ok: true,
-            response,
-            command,
-            executed_at: nowIso()
+            command: newCommand
         });
         
     } catch (error) {
-        console.error('Execute bot command error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
-// ===== Subscriptions & Payments =====
-app.get('/api/subscriptions', authMiddleware, (req, res) => {
-    try {
-        res.json({
-            ok: true,
-            subscriptions: subscriptions.filter(sub => sub.is_active)
-        });
-        
-    } catch (error) {
-        console.error('Get subscriptions error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
-app.get('/api/payment-methods', authMiddleware, (req, res) => {
-    try {
-        res.json({
-            ok: true,
-            methods: paymentMethods.filter(method => method.is_active)
-        });
-        
-    } catch (error) {
-        console.error('Get payment methods error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
-app.post('/api/subscriptions/subscribe', authMiddleware, (req, res) => {
-    try {
-        const { plan_id, payment_method, payment_data } = req.body;
-        
-        const plan = subscriptions.find(s => s.id === plan_id && s.is_active);
-        if (!plan) {
-            return res.status(404).json({ ok: false, error: 'PLAN_NOT_FOUND' });
-        }
-        
-        const method = paymentMethods.find(pm => pm.id === payment_method && pm.is_active);
-        if (!method) {
-            return res.status(400).json({ ok: false, error: 'PAYMENT_METHOD_INVALID' });
-        }
-        
-        // Handle different payment methods
-        if (method.method_key === 'points') {
-            // Pay with points
-            if (req.user.points < plan.price_points) {
-                return res.status(400).json({ ok: false, error: 'INSUFFICIENT_POINTS' });
-            }
-            
-            req.user.points -= plan.price_points;
-            
-            // Record transaction
-            pointTransactions.push({
-                id: pointTransactions.length + 1,
-                from_user_id: req.user.id,
-                to_user_id: null,
-                amount: plan.price_points,
-                reason: `Subscription: ${plan.name}`,
-                created_at: nowIso()
-            });
-        } else if (method.method_key === 'stripe') {
-            // In real app, integrate with Stripe
-            // For demo, simulate success
-            console.log('Simulating Stripe payment:', payment_data);
-        } else if (method.method_key === 'paypal') {
-            // In real app, integrate with PayPal
-            console.log('Simulating PayPal payment:', payment_data);
-        }
-        
-        // Calculate expiration date
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + plan.duration_days);
-        
-        // Create subscription
-        const subscriptionId = userSubscriptions.length + 1;
-        userSubscriptions.push({
-            id: subscriptionId,
-            user_id: req.user.id,
-            plan_id: plan.id,
-            status: 'active',
-            payment_method: method.method_key,
-            amount_paid: plan.price_points,
-            starts_at: nowIso(),
-            expires_at: expiresAt.toISOString(),
-            created_at: nowIso()
-        });
-        
-        // Give subscription benefits
-        if (plan.plan_key === 'premium') {
-            req.user.points += 2000; // Monthly points
-        } else if (plan.plan_key === 'vip') {
-            req.user.points += 5000; // Monthly points
-        }
-        
-        res.json({
-            ok: true,
-            subscription_id: subscriptionId,
-            expires_at: expiresAt.toISOString(),
-            message: 'Subscription activated successfully'
-        });
-        
-    } catch (error) {
-        console.error('Subscribe error:', error);
+        console.error('Create bot command error:', error);
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
@@ -1759,69 +1497,6 @@ app.get('/api/admin/users', authMiddleware, (req, res) => {
         
     } catch (error) {
         console.error('Get admin users error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
-app.post('/api/admin/users/:id/toggle-ban', authMiddleware, (req, res) => {
-    try {
-        // Only developers can ban users
-        if (!req.user.is_developer) {
-            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
-        }
-        
-        const userId = mustInt(req.params.id);
-        const user = users.find(u => u.id === userId);
-        
-        if (!user) {
-            return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND' });
-        }
-        
-        // Cannot ban yourself
-        if (user.id === req.user.id) {
-            return res.status(400).json({ ok: false, error: 'CANNOT_BAN_SELF' });
-        }
-        
-        // Toggle ban
-        user.banned = !user.banned;
-        
-        res.json({
-            ok: true,
-            banned: user.banned,
-            message: `User ${user.banned ? 'banned' : 'unbanned'} successfully`
-        });
-        
-    } catch (error) {
-        console.error('Toggle ban error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
-
-app.post('/api/admin/users/:id/toggle-verify', authMiddleware, (req, res) => {
-    try {
-        // Only developers can verify users
-        if (!req.user.is_developer) {
-            return res.status(403).json({ ok: false, error: 'PERMISSION_DENIED' });
-        }
-        
-        const userId = mustInt(req.params.id);
-        const user = users.find(u => u.id === userId);
-        
-        if (!user) {
-            return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND' });
-        }
-        
-        // Toggle verification
-        user.verified = !user.verified;
-        
-        res.json({
-            ok: true,
-            verified: user.verified,
-            message: `User ${user.verified ? 'verified' : 'unverified'} successfully`
-        });
-        
-    } catch (error) {
-        console.error('Toggle verify error:', error);
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
@@ -1858,31 +1533,27 @@ app.get('/api/search/users', authMiddleware, (req, res) => {
     }
 });
 
-app.get('/api/search/rooms', authMiddleware, (req, res) => {
+// ===== Subscriptions & Payment =====
+app.get('/api/subscriptions', authMiddleware, (req, res) => {
     try {
-        const { query } = req.query;
-        
-        if (!query || query.length < 2) {
-            return res.json({ ok: true, rooms: [] });
-        }
-        
-        const searchResults = rooms
-            .filter(room => 
-                room.name.toLowerCase().includes(query.toLowerCase()) ||
-                (room.description && room.description.toLowerCase().includes(query.toLowerCase()))
-            )
-            .map(room => ({
-                ...room,
-                member_count: roomMembers.filter(rm => rm.room_id === room.id && !rm.is_banned).length
-            }));
-        
         res.json({
             ok: true,
-            rooms: searchResults
+            subscriptions: subscriptions
         });
-        
     } catch (error) {
-        console.error('Search rooms error:', error);
+        console.error('Get subscriptions error:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
+
+app.get('/api/payment-methods', authMiddleware, (req, res) => {
+    try {
+        res.json({
+            ok: true,
+            methods: paymentMethods
+        });
+    } catch (error) {
+        console.error('Get payment methods error:', error);
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
@@ -1936,11 +1607,10 @@ io.on('connection', (socket) => {
         voiceSeat: null
     });
     
-    // Broadcast online status
-    io.emit('user_online', {
+    // Send authentication confirmation
+    socket.emit('authenticated', {
         user_id: socket.user.id,
-        username: socket.user.username,
-        avatar_url: socket.user.avatar_url
+        username: socket.user.username
     });
     
     // ===== Room Events =====
@@ -1950,7 +1620,7 @@ io.on('connection', (socket) => {
             const room = rooms.find(r => r.id === roomId);
             
             if (!room) {
-                return socket.emit('error', { message: 'Room not found' });
+                return socket.emit('error', { error: 'Room not found' });
             }
             
             // Check if user is banned from room
@@ -1959,14 +1629,14 @@ io.on('connection', (socket) => {
             );
             
             if (roomMember?.is_banned) {
-                return socket.emit('error', { message: 'You are banned from this room' });
+                return socket.emit('error', { error: 'You are banned from this room' });
             }
             
             // Check if room requires points to join
             if (room.price_points > 0 && !roomMember) {
                 if (socket.user.points < room.price_points) {
                     return socket.emit('error', { 
-                        message: `Not enough points (${room.price_points} required)` 
+                        error: `Not enough points (${room.price_points} required)` 
                     });
                 }
                 
@@ -2014,7 +1684,7 @@ io.on('connection', (socket) => {
                 };
                 messages.push(systemMsg);
                 
-                io.to(`room_${roomId}`).emit('new_message', systemMsg);
+                io.to(`room_${roomId}`).emit('chat', { message: systemMsg });
             }
             
             // Join socket room
@@ -2025,14 +1695,6 @@ io.on('connection', (socket) => {
             if (userConn) {
                 userConn.rooms.add(roomId);
             }
-            
-            // Notify room
-            socket.to(`room_${roomId}`).emit('user_joined_room', {
-                user_id: socket.user.id,
-                username: socket.user.username,
-                avatar_url: socket.user.avatar_url,
-                frame_id: socket.user.frame_id
-            });
             
             // Send current room state
             const roomMessages = messages
@@ -2065,16 +1727,28 @@ io.on('connection', (socket) => {
                     }));
             }
             
-            socket.emit('room_state', {
-                room,
-                messages: roomMessages,
-                users: roomUsers,
-                voice_seats: voiceSeatsData
+            // Send members snapshot
+            socket.emit('members_snapshot', {
+                room_id: roomId,
+                members: roomUsers
+            });
+            
+            // Send seats snapshot if voice room
+            if (room.type === 'voice') {
+                socket.emit('seats_snapshot', {
+                    room_id: roomId,
+                    seats: voiceSeatsData
+                });
+            }
+            
+            // Send existing messages
+            roomMessages.forEach(message => {
+                socket.emit('chat', { message });
             });
             
         } catch (error) {
             console.error('Join room error:', error);
-            socket.emit('error', { message: 'Internal server error' });
+            socket.emit('error', { error: 'Internal server error' });
         }
     });
     
@@ -2091,12 +1765,6 @@ io.on('connection', (socket) => {
                 userConn.rooms.delete(roomId);
             }
             
-            // Notify room
-            socket.to(`room_${roomId}`).emit('user_left_room', {
-                user_id: socket.user.id,
-                username: socket.user.username
-            });
-            
             // Free voice seat if occupied
             const seatIndex = voiceSeats.findIndex(vs => 
                 vs.room_id === roomId && vs.user_id === socket.user.id
@@ -2107,7 +1775,10 @@ io.on('connection', (socket) => {
                 voiceSeats[seatIndex].updated_at = nowIso();
                 
                 // Broadcast seat update
-                io.to(`room_${roomId}`).emit('voice_seat_update', voiceSeats[seatIndex]);
+                io.to(`room_${roomId}`).emit('seats_snapshot', {
+                    room_id: roomId,
+                    seats: voiceSeats.filter(vs => vs.room_id === roomId)
+                });
             }
             
         } catch (error) {
@@ -2116,14 +1787,14 @@ io.on('connection', (socket) => {
     });
     
     // ===== Chat Events =====
-    socket.on('send_message', (data) => {
+    socket.on('chat', (data) => {
         try {
             const roomId = mustInt(data.room_id);
             const { text, message_type, metadata } = data;
             
             // Validate
             if (!text || text.trim().length === 0) {
-                return socket.emit('error', { message: 'Message cannot be empty' });
+                return socket.emit('error', { error: 'Message cannot be empty' });
             }
             
             // Check if user is in room
@@ -2132,12 +1803,12 @@ io.on('connection', (socket) => {
             );
             
             if (!roomMember) {
-                return socket.emit('error', { message: 'You are not a member of this room' });
+                return socket.emit('error', { error: 'You are not a member of this room' });
             }
             
             // Check if muted
             if (roomMember.muted_until && new Date(roomMember.muted_until) > new Date()) {
-                return socket.emit('error', { message: 'You are muted in this room' });
+                return socket.emit('error', { error: 'You are muted in this room' });
             }
             
             // Check if chat is locked
@@ -2145,7 +1816,7 @@ io.on('connection', (socket) => {
             if (room) {
                 const settings = safeJsonParse(room.settings_json) || {};
                 if (settings.chat_locked && roomMember.role !== 'owner' && roomMember.role !== 'admin') {
-                    return socket.emit('error', { message: 'Chat is locked in this room' });
+                    return socket.emit('error', { error: 'Chat is locked in this room' });
                 }
             }
             
@@ -2167,59 +1838,39 @@ io.on('connection', (socket) => {
             messages.push(message);
             
             // Broadcast to room
-            io.to(`room_${roomId}`).emit('new_message', message);
+            io.to(`room_${roomId}`).emit('chat', { message });
             
-            // Apply auto-delete if configured
-            if (room && room.settings_json) {
-                const settings = safeJsonParse(room.settings_json);
-                if (settings.auto_delete_limit > 0) {
-                    const roomMessages = messages.filter(m => m.room_id === roomId);
-                    if (roomMessages.length > settings.auto_delete_limit) {
-                        const messagesToDelete = roomMessages
-                            .slice(0, roomMessages.length - settings.auto_delete_limit);
-                        
-                        messagesToDelete.forEach(msg => {
-                            msg.deleted = true;
-                        });
-                        
-                        io.to(`room_${roomId}`).emit('messages_deleted', {
-                            count: messagesToDelete.length
-                        });
-                    }
-                }
+            // Check for bot commands
+            if (text.startsWith('!')) {
+                const command = text.substring(1).toLowerCase().split(' ')[0];
+                const args = text.substring(1).split(' ').slice(1);
+                processBotCommand(command, args, socket.user, roomId, socket);
             }
             
         } catch (error) {
             console.error('Send message error:', error);
-            socket.emit('error', { message: 'Failed to send message' });
+            socket.emit('error', { error: 'Failed to send message' });
         }
     });
     
-    socket.on('typing_start', (data) => {
+    socket.on('typing', (data) => {
         try {
             const roomId = mustInt(data.room_id);
-            socket.to(`room_${roomId}`).emit('user_typing', {
+            const isTyping = data.on;
+            
+            socket.to(`room_${roomId}`).emit('typing', {
+                room_id: roomId,
                 user_id: socket.user.id,
-                username: socket.user.username
+                username: socket.user.username,
+                on: isTyping
             });
         } catch (error) {
-            console.error('Typing start error:', error);
-        }
-    });
-    
-    socket.on('typing_stop', (data) => {
-        try {
-            const roomId = mustInt(data.room_id);
-            socket.to(`room_${roomId}`).emit('user_stopped_typing', {
-                user_id: socket.user.id
-            });
-        } catch (error) {
-            console.error('Typing stop error:', error);
+            console.error('Typing error:', error);
         }
     });
     
     // ===== Voice Room Events =====
-    socket.on('join_voice_seat', (data) => {
+    socket.on('seat_join', (data) => {
         try {
             const { room_id, seat_index } = data;
             const roomId = mustInt(room_id);
@@ -2228,7 +1879,7 @@ io.on('connection', (socket) => {
             // Check if room is voice room
             const room = rooms.find(r => r.id === roomId && r.type === 'voice');
             if (!room) {
-                return socket.emit('error', { message: 'Voice room not found' });
+                return socket.emit('error', { error: 'Voice room not found' });
             }
             
             // Check if seat exists
@@ -2237,17 +1888,17 @@ io.on('connection', (socket) => {
             );
             
             if (!seat) {
-                return socket.emit('error', { message: 'Seat not found' });
+                return socket.emit('error', { error: 'Seat not found' });
             }
             
             // Check if seat is locked
             if (seat.is_locked) {
-                return socket.emit('error', { message: 'Seat is locked' });
+                return socket.emit('error', { error: 'Seat is locked' });
             }
             
             // Check if seat is already occupied
             if (seat.user_id && seat.user_id !== socket.user.id) {
-                return socket.emit('error', { message: 'Seat already occupied' });
+                return socket.emit('error', { error: 'Seat already occupied' });
             }
             
             // Free previous seat if any
@@ -2259,8 +1910,6 @@ io.on('connection', (socket) => {
                 previousSeat.user_id = null;
                 previousSeat.is_muted = false;
                 previousSeat.updated_at = nowIso();
-                
-                io.to(`room_${roomId}`).emit('voice_seat_update', previousSeat);
             }
             
             // Occupy new seat
@@ -2274,37 +1923,19 @@ io.on('connection', (socket) => {
                 userConn.voiceSeat = { roomId, seatIndex: seatIdx };
             }
             
-            // Broadcast seat update
-            io.to(`room_${roomId}`).emit('voice_seat_update', {
-                ...seat,
-                username: socket.user.username,
-                avatar_url: socket.user.avatar_url
-            });
-            
-            // Send system message
-            const systemMsg = {
-                id: messages.length + 1,
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
                 room_id: roomId,
-                user_id: null,
-                username: 'System',
-                text: `${socket.user.username} joined voice seat ${seatIdx}`,
-                message_type: 'system',
-                metadata_json: JSON.stringify({}),
-                edited: false,
-                deleted: false,
-                created_at: nowIso(),
-                updated_at: nowIso()
-            };
-            messages.push(systemMsg);
-            io.to(`room_${roomId}`).emit('new_message', systemMsg);
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
             
         } catch (error) {
             console.error('Join voice seat error:', error);
-            socket.emit('error', { message: 'Failed to join voice seat' });
+            socket.emit('error', { error: 'Failed to join voice seat' });
         }
     });
     
-    socket.on('leave_voice_seat', (data) => {
+    socket.on('seat_leave', (data) => {
         try {
             const { room_id } = data;
             const roomId = mustInt(room_id);
@@ -2329,34 +1960,20 @@ io.on('connection', (socket) => {
                 userConn.voiceSeat = null;
             }
             
-            // Broadcast seat update
-            io.to(`room_${roomId}`).emit('voice_seat_update', seat);
-            
-            // Send system message
-            const systemMsg = {
-                id: messages.length + 1,
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
                 room_id: roomId,
-                user_id: null,
-                username: 'System',
-                text: `${socket.user.username} left voice`,
-                message_type: 'system',
-                metadata_json: JSON.stringify({}),
-                edited: false,
-                deleted: false,
-                created_at: nowIso(),
-                updated_at: nowIso()
-            };
-            messages.push(systemMsg);
-            io.to(`room_${roomId}`).emit('new_message', systemMsg);
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
             
         } catch (error) {
             console.error('Leave voice seat error:', error);
         }
     });
     
-    socket.on('toggle_mute_voice_seat', (data) => {
+    socket.on('seat_mute', (data) => {
         try {
-            const { room_id, seat_index, muted } = data;
+            const { room_id, seat_index } = data;
             const roomId = mustInt(room_id);
             const seatIdx = mustInt(seat_index);
             
@@ -2366,7 +1983,7 @@ io.on('connection', (socket) => {
             );
             
             if (!seat) {
-                return socket.emit('error', { message: 'Seat not found' });
+                return socket.emit('error', { error: 'Seat not found' });
             }
             
             // Check permissions
@@ -2374,31 +1991,73 @@ io.on('connection', (socket) => {
             const isSeatOwner = seat.user_id === socket.user.id;
             
             if (!canModerate && !isSeatOwner) {
-                return socket.emit('error', { message: 'Permission denied' });
+                return socket.emit('error', { error: 'Permission denied' });
             }
             
-            // Toggle mute
-            seat.is_muted = muted;
+            // Mute seat
+            seat.is_muted = true;
             seat.updated_at = nowIso();
             
-            // Broadcast seat update
-            io.to(`room_${roomId}`).emit('voice_seat_update', seat);
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
+                room_id: roomId,
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
             
         } catch (error) {
-            console.error('Toggle mute voice seat error:', error);
-            socket.emit('error', { message: 'Failed to toggle mute' });
+            console.error('Mute seat error:', error);
+            socket.emit('error', { error: 'Failed to mute seat' });
         }
     });
     
-    socket.on('lock_voice_seat', (data) => {
+    socket.on('seat_unmute', (data) => {
         try {
-            const { room_id, seat_index, locked } = data;
+            const { room_id, seat_index } = data;
+            const roomId = mustInt(room_id);
+            const seatIdx = mustInt(seat_index);
+            
+            // Find seat
+            const seat = voiceSeats.find(vs => 
+                vs.room_id === roomId && vs.seat_index === seatIdx
+            );
+            
+            if (!seat) {
+                return socket.emit('error', { error: 'Seat not found' });
+            }
+            
+            // Check permissions
+            const canModerate = canModerateRoom(roomId, socket.user.id);
+            const isSeatOwner = seat.user_id === socket.user.id;
+            
+            if (!canModerate && !isSeatOwner) {
+                return socket.emit('error', { error: 'Permission denied' });
+            }
+            
+            // Unmute seat
+            seat.is_muted = false;
+            seat.updated_at = nowIso();
+            
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
+                room_id: roomId,
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
+            
+        } catch (error) {
+            console.error('Unmute seat error:', error);
+            socket.emit('error', { error: 'Failed to unmute seat' });
+        }
+    });
+    
+    socket.on('seat_lock', (data) => {
+        try {
+            const { room_id, seat_index } = data;
             const roomId = mustInt(room_id);
             const seatIdx = mustInt(seat_index);
             
             // Check permissions
             if (!canModerateRoom(roomId, socket.user.id)) {
-                return socket.emit('error', { message: 'Permission denied' });
+                return socket.emit('error', { error: 'Permission denied' });
             }
             
             // Find seat
@@ -2407,19 +2066,19 @@ io.on('connection', (socket) => {
             );
             
             if (!seat) {
-                return socket.emit('error', { message: 'Seat not found' });
+                return socket.emit('error', { error: 'Seat not found' });
             }
             
-            // Lock/unlock seat
-            seat.is_locked = locked;
+            // Lock seat
+            seat.is_locked = true;
             seat.updated_at = nowIso();
             
             // If locking and seat is occupied, kick user
-            if (locked && seat.user_id) {
+            if (seat.user_id) {
                 // Notify user
                 const userSocketId = connectedUsersMap.get(seat.user_id)?.socketId;
                 if (userSocketId) {
-                    io.to(userSocketId).emit('voice_seat_locked', {
+                    io.to(userSocketId).emit('seat_kicked', {
                         room_id: roomId,
                         seat_index: seatIdx
                     });
@@ -2429,116 +2088,738 @@ io.on('connection', (socket) => {
                 seat.is_muted = false;
             }
             
-            // Broadcast seat update
-            io.to(`room_${roomId}`).emit('voice_seat_update', seat);
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
+                room_id: roomId,
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
             
         } catch (error) {
-            console.error('Lock voice seat error:', error);
-            socket.emit('error', { message: 'Failed to lock seat' });
+            console.error('Lock seat error:', error);
+            socket.emit('error', { error: 'Failed to lock seat' });
+        }
+    });
+    
+    socket.on('seat_unlock', (data) => {
+        try {
+            const { room_id, seat_index } = data;
+            const roomId = mustInt(room_id);
+            const seatIdx = mustInt(seat_index);
+            
+            // Check permissions
+            if (!canModerateRoom(roomId, socket.user.id)) {
+                return socket.emit('error', { error: 'Permission denied' });
+            }
+            
+            // Find seat
+            const seat = voiceSeats.find(vs => 
+                vs.room_id === roomId && vs.seat_index === seatIdx
+            );
+            
+            if (!seat) {
+                return socket.emit('error', { error: 'Seat not found' });
+            }
+            
+            // Unlock seat
+            seat.is_locked = false;
+            seat.updated_at = nowIso();
+            
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
+                room_id: roomId,
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
+            
+        } catch (error) {
+            console.error('Unlock seat error:', error);
+            socket.emit('error', { error: 'Failed to unlock seat' });
+        }
+    });
+    
+    socket.on('seat_kick', (data) => {
+        try {
+            const { room_id, target_user_id } = data;
+            const roomId = mustInt(room_id);
+            const targetUserId = mustInt(target_user_id);
+            
+            // Check permissions
+            if (!canModerateRoom(roomId, socket.user.id)) {
+                return socket.emit('error', { error: 'Permission denied' });
+            }
+            
+            // Find seat occupied by target user
+            const seat = voiceSeats.find(vs => 
+                vs.room_id === roomId && vs.user_id === targetUserId
+            );
+            
+            if (!seat) {
+                return socket.emit('error', { error: 'User not in a seat' });
+            }
+            
+            // Kick user from seat
+            seat.user_id = null;
+            seat.is_muted = false;
+            seat.updated_at = nowIso();
+            
+            // Notify user
+            const userSocketId = connectedUsersMap.get(targetUserId)?.socketId;
+            if (userSocketId) {
+                io.to(userSocketId).emit('seat_kicked', {
+                    room_id: roomId,
+                    seat_index: seat.seat_index
+                });
+            }
+            
+            // Broadcast seats snapshot
+            io.to(`room_${roomId}`).emit('seats_snapshot', {
+                room_id: roomId,
+                seats: voiceSeats.filter(vs => vs.room_id === roomId)
+            });
+            
+        } catch (error) {
+            console.error('Kick from seat error:', error);
+            socket.emit('error', { error: 'Failed to kick user' });
+        }
+    });
+    
+    // ===== Moderation Events =====
+    socket.on('moderate', (data) => {
+        try {
+            const { room_id, action, target_user_id, minutes } = data;
+            const roomId = mustInt(room_id);
+            const targetUserId = mustInt(target_user_id);
+            
+            // Check permissions
+            if (!canModerateRoom(roomId, socket.user.id)) {
+                return socket.emit('error', { error: 'Permission denied' });
+            }
+            
+            const targetMember = roomMembers.find(rm => 
+                rm.room_id === roomId && rm.user_id === targetUserId
+            );
+            
+            if (!targetMember) {
+                return socket.emit('error', { error: 'User not in room' });
+            }
+            
+            switch (action) {
+                case 'mute':
+                    const muteUntil = new Date();
+                    muteUntil.setMinutes(muteUntil.getMinutes() + (minutes || 15));
+                    targetMember.muted_until = muteUntil.toISOString();
+                    
+                    // Send system message
+                    const muteMsg = {
+                        id: messages.length + 1,
+                        room_id: roomId,
+                        user_id: null,
+                        username: 'System',
+                        text: `تم كتم ${users.find(u => u.id === targetUserId)?.username} لمدة ${minutes} دقيقة`,
+                        message_type: 'system',
+                        metadata_json: JSON.stringify({}),
+                        edited: false,
+                        deleted: false,
+                        created_at: nowIso(),
+                        updated_at: nowIso()
+                    };
+                    messages.push(muteMsg);
+                    io.to(`room_${roomId}`).emit('chat', { message: muteMsg });
+                    break;
+                    
+                case 'ban':
+                    targetMember.is_banned = true;
+                    // Kick from voice seat if in one
+                    const seat = voiceSeats.find(vs => 
+                        vs.room_id === roomId && vs.user_id === targetUserId
+                    );
+                    if (seat) {
+                        seat.user_id = null;
+                        seat.is_muted = false;
+                    }
+                    
+                    // Send system message
+                    const banMsg = {
+                        id: messages.length + 1,
+                        room_id: roomId,
+                        user_id: null,
+                        username: 'System',
+                        text: `تم حظر ${users.find(u => u.id === targetUserId)?.username} من الغرفة`,
+                        message_type: 'system',
+                        metadata_json: JSON.stringify({}),
+                        edited: false,
+                        deleted: false,
+                        created_at: nowIso(),
+                        updated_at: nowIso()
+                    };
+                    messages.push(banMsg);
+                    io.to(`room_${roomId}`).emit('chat', { message: banMsg });
+                    break;
+                    
+                case 'kick':
+                    // Send system message
+                    const kickMsg = {
+                        id: messages.length + 1,
+                        room_id: roomId,
+                        user_id: null,
+                        username: 'System',
+                        text: `تم طرد ${users.find(u => u.id === targetUserId)?.username} من الغرفة`,
+                        message_type: 'system',
+                        metadata_json: JSON.stringify({}),
+                        edited: false,
+                        deleted: false,
+                        created_at: nowIso(),
+                        updated_at: nowIso()
+                    };
+                    messages.push(kickMsg);
+                    io.to(`room_${roomId}`).emit('chat', { message: kickMsg });
+                    break;
+                    
+                case 'restrict':
+                    targetMember.role = 'restricted';
+                    break;
+            }
+            
+            // Broadcast updated members list
+            const roomUsers = roomMembers
+                .filter(rm => rm.room_id === roomId && !rm.is_banned)
+                .map(rm => {
+                    const user = users.find(u => u.id === rm.user_id);
+                    const isOnline = connectedUsersMap.has(rm.user_id);
+                    return {
+                        ...rm,
+                        username: user?.username,
+                        avatar_url: user?.avatar_url,
+                        is_online: isOnline
+                    };
+                });
+            
+            io.to(`room_${roomId}`).emit('members_snapshot', {
+                room_id: roomId,
+                members: roomUsers
+            });
+            
+        } catch (error) {
+            console.error('Moderate error:', error);
+            socket.emit('error', { error: 'Failed to moderate user' });
+        }
+    });
+    
+    socket.on('set_label', (data) => {
+        try {
+            const { room_id, target_user_id, label_text, label_color } = data;
+            const roomId = mustInt(room_id);
+            const targetUserId = mustInt(target_user_id);
+            
+            // Check permissions
+            if (!canModerateRoom(roomId, socket.user.id)) {
+                return socket.emit('error', { error: 'Permission denied' });
+            }
+            
+            const targetMember = roomMembers.find(rm => 
+                rm.room_id === roomId && rm.user_id === targetUserId
+            );
+            
+            if (!targetMember) {
+                return socket.emit('error', { error: 'User not in room' });
+            }
+            
+            // Set label
+            targetMember.label_text = label_text;
+            targetMember.label_color = label_color || '#007AFF';
+            
+            // Send system message
+            const labelMsg = {
+                id: messages.length + 1,
+                room_id: roomId,
+                user_id: null,
+                username: 'System',
+                text: `تم تعيين تسمية "${label_text}" لـ ${users.find(u => u.id === targetUserId)?.username}`,
+                message_type: 'system',
+                metadata_json: JSON.stringify({}),
+                edited: false,
+                deleted: false,
+                created_at: nowIso(),
+                updated_at: nowIso()
+            };
+            messages.push(labelMsg);
+            io.to(`room_${roomId}`).emit('chat', { message: labelMsg });
+            
+            // Broadcast updated members list
+            const roomUsers = roomMembers
+                .filter(rm => rm.room_id === roomId && !rm.is_banned)
+                .map(rm => {
+                    const user = users.find(u => u.id === rm.user_id);
+                    const isOnline = connectedUsersMap.has(rm.user_id);
+                    return {
+                        ...rm,
+                        username: user?.username,
+                        avatar_url: user?.avatar_url,
+                        is_online: isOnline
+                    };
+                });
+            
+            io.to(`room_${roomId}`).emit('members_snapshot', {
+                room_id: roomId,
+                members: roomUsers
+            });
+            
+        } catch (error) {
+            console.error('Set label error:', error);
+            socket.emit('error', { error: 'Failed to set label' });
+        }
+    });
+    
+    socket.on('transfer_owner', (data) => {
+        try {
+            const { room_id, new_owner_id } = data;
+            const roomId = mustInt(room_id);
+            const newOwnerId = mustInt(new_owner_id);
+            
+            // Check if current user is room owner
+            const room = rooms.find(r => r.id === roomId);
+            if (!room || room.owner_id !== socket.user.id) {
+                return socket.emit('error', { error: 'Only room owner can transfer ownership' });
+            }
+            
+            // Find new owner member
+            const newOwnerMember = roomMembers.find(rm => 
+                rm.room_id === roomId && rm.user_id === newOwnerId
+            );
+            
+            if (!newOwnerMember) {
+                return socket.emit('error', { error: 'New owner must be a room member' });
+            }
+            
+            // Transfer ownership
+            room.owner_id = newOwnerId;
+            
+            // Update roles
+            roomMembers.forEach(rm => {
+                if (rm.room_id === roomId) {
+                    if (rm.user_id === newOwnerId) {
+                        rm.role = 'owner';
+                        rm.label_text = 'المالك';
+                        rm.label_color = '#FF9500';
+                    } else if (rm.user_id === socket.user.id) {
+                        rm.role = 'admin'; // Old owner becomes admin
+                        rm.label_text = 'مدير سابق';
+                        rm.label_color = '#007AFF';
+                    }
+                }
+            });
+            
+            // Broadcast ownership transfer
+            io.to(`room_${roomId}`).emit('owner_transfer', {
+                room_id: roomId,
+                old_owner_id: socket.user.id,
+                new_owner_id: newOwnerId,
+                timestamp: nowIso()
+            });
+            
+            // Send system message
+            const newOwnerUser = users.find(u => u.id === newOwnerId);
+            const systemMsg = {
+                id: messages.length + 1,
+                room_id: roomId,
+                user_id: null,
+                username: 'System',
+                text: `تم نقل ملكية الغرفة من ${socket.user.username} إلى ${newOwnerUser?.username || 'unknown'}`,
+                message_type: 'system',
+                metadata_json: JSON.stringify({}),
+                edited: false,
+                deleted: false,
+                created_at: nowIso(),
+                updated_at: nowIso()
+            };
+            messages.push(systemMsg);
+            
+            io.to(`room_${roomId}`).emit('chat', { message: systemMsg });
+            
+            // Broadcast updated members list
+            const roomUsers = roomMembers
+                .filter(rm => rm.room_id === roomId && !rm.is_banned)
+                .map(rm => {
+                    const user = users.find(u => u.id === rm.user_id);
+                    const isOnline = connectedUsersMap.has(rm.user_id);
+                    return {
+                        ...rm,
+                        username: user?.username,
+                        avatar_url: user?.avatar_url,
+                        is_online: isOnline
+                    };
+                });
+            
+            io.to(`room_${roomId}`).emit('members_snapshot', {
+                room_id: roomId,
+                members: roomUsers
+            });
+            
+        } catch (error) {
+            console.error('Transfer owner error:', error);
+            socket.emit('error', { error: 'Failed to transfer ownership' });
         }
     });
     
     // ===== WebRTC Signaling =====
-    socket.on('voice_signal', (data) => {
+    socket.on('webrtc_offer', (data) => {
         try {
-            const { to_user_id, signal } = data;
+            const { room_id, to_user_id, sdp } = data;
+            const roomId = mustInt(room_id);
+            const toUserId = mustInt(to_user_id);
             
-            // Forward signal to target user
-            const targetConn = connectedUsersMap.get(to_user_id);
-            if (targetConn) {
-                io.to(targetConn.socketId).emit('voice_signal', {
+            // Forward offer to target user
+            const targetSocketId = connectedUsersMap.get(toUserId)?.socketId;
+            if (targetSocketId) {
+                io.to(targetSocketId).emit('webrtc_offer', {
+                    room_id: roomId,
                     from_user_id: socket.user.id,
-                    signal: signal
+                    sdp: sdp
                 });
             }
             
         } catch (error) {
-            console.error('Voice signal error:', error);
+            console.error('WebRTC offer error:', error);
         }
     });
     
-    // ===== Notification Events =====
-    socket.on('mark_notification_read', (data) => {
+    socket.on('webrtc_answer', (data) => {
         try {
-            const { notification_id } = data;
+            const { room_id, to_user_id, sdp } = data;
+            const roomId = mustInt(room_id);
+            const toUserId = mustInt(to_user_id);
             
-            const notification = notifications.find(n => 
-                n.id === notification_id && n.user_id === socket.user.id
-            );
-            
-            if (notification) {
-                notification.read = true;
-                notification.read_at = nowIso();
-                
-                socket.emit('notification_updated', notification);
+            // Forward answer to target user
+            const targetSocketId = connectedUsersMap.get(toUserId)?.socketId;
+            if (targetSocketId) {
+                io.to(targetSocketId).emit('webrtc_answer', {
+                    room_id: roomId,
+                    from_user_id: socket.user.id,
+                    sdp: sdp
+                });
             }
             
         } catch (error) {
-            console.error('Mark notification read error:', error);
+            console.error('WebRTC answer error:', error);
         }
     });
     
-    // ===== Disconnection Handling =====
-    socket.on('disconnect', () => {
-        console.log(`🔌 User disconnected: ${socket.user.username}`);
-        
-        const userConn = connectedUsersMap.get(socket.user.id);
-        if (!userConn) return;
-        
-        // Leave all rooms
-        userConn.rooms.forEach(roomId => {
-            // Free voice seat if occupied
-            const seat = voiceSeats.find(vs => 
-                vs.room_id === roomId && vs.user_id === socket.user.id
-            );
+    socket.on('webrtc_ice', (data) => {
+        try {
+            const { room_id, to_user_id, candidate } = data;
+            const roomId = mustInt(room_id);
+            const toUserId = mustInt(to_user_id);
             
-            if (seat) {
-                seat.user_id = null;
-                seat.is_muted = false;
-                seat.updated_at = nowIso();
-                
-                io.to(`room_${roomId}`).emit('voice_seat_update', seat);
+            // Forward ICE candidate to target user
+            const targetSocketId = connectedUsersMap.get(toUserId)?.socketId;
+            if (targetSocketId) {
+                io.to(targetSocketId).emit('webrtc_ice', {
+                    room_id: roomId,
+                    from_user_id: socket.user.id,
+                    candidate: candidate
+                });
             }
             
-            // Notify room
-            socket.to(`room_${roomId}`).emit('user_left_room', {
-                user_id: socket.user.id,
-                username: socket.user.username
-            });
-        });
-        
-        // Remove from connected users
-        connectedUsersMap.delete(socket.user.id);
-        
-        // Update last seen
-        const user = users.find(u => u.id === socket.user.id);
-        if (user) {
-            user.last_seen = nowIso();
+        } catch (error) {
+            console.error('WebRTC ICE error:', error);
         }
-        
-        // Broadcast offline status
-        io.emit('user_offline', {
-            user_id: socket.user.id,
-            username: socket.user.username
-        });
     });
     
-    // ===== Heartbeat =====
+    // ===== System Events =====
+    socket.on('get_room_data', (data) => {
+        try {
+            const roomId = mustInt(data.room_id);
+            
+            const room = rooms.find(r => r.id === roomId);
+            if (!room) return;
+            
+            const roomUsers = roomMembers
+                .filter(rm => rm.room_id === roomId && !rm.is_banned)
+                .map(rm => {
+                    const user = users.find(u => u.id === rm.user_id);
+                    const isOnline = connectedUsersMap.has(rm.user_id);
+                    return {
+                        ...rm,
+                        username: user?.username,
+                        avatar_url: user?.avatar_url,
+                        is_online: isOnline
+                    };
+                });
+            
+            socket.emit('members_snapshot', {
+                room_id: roomId,
+                members: roomUsers
+            });
+            
+            if (room.type === 'voice') {
+                socket.emit('seats_snapshot', {
+                    room_id: roomId,
+                    seats: voiceSeats.filter(vs => vs.room_id === roomId)
+                });
+            }
+            
+        } catch (error) {
+            console.error('Get room data error:', error);
+        }
+    });
+    
+    // ===== Heartbeat/Presence =====
     socket.on('heartbeat', () => {
-        // Update last seen
-        const userConn = connectedUsersMap.get(socket.user.id);
-        if (userConn) {
-            userConn.lastHeartbeat = Date.now();
+        try {
+            // Update user last seen
+            const userIndex = users.findIndex(u => u.id === socket.user.id);
+            if (userIndex !== -1) {
+                users[userIndex].last_seen = nowIso();
+            }
+            
+            // Notify rooms user is in
+            const userConn = connectedUsersMap.get(socket.user.id);
+            if (userConn) {
+                userConn.rooms.forEach(roomId => {
+                    io.to(`room_${roomId}`).emit('user_online', {
+                        user_id: socket.user.id,
+                        username: socket.user.username,
+                        timestamp: nowIso()
+                    });
+                });
+            }
+        } catch (error) {
+            console.error('Heartbeat error:', error);
+        }
+    });
+    
+    // ===== Disconnection =====
+    socket.on('disconnect', () => {
+        try {
+            console.log(`🔌 User disconnected: ${socket.user?.username} (ID: ${socket.id})`);
+            
+            const userConn = connectedUsersMap.get(socket.user.id);
+            if (userConn) {
+                // Leave all rooms
+                userConn.rooms.forEach(roomId => {
+                    // Free voice seat if occupied
+                    const seat = voiceSeats.find(vs => 
+                        vs.room_id === roomId && vs.user_id === socket.user.id
+                    );
+                    
+                    if (seat) {
+                        seat.user_id = null;
+                        seat.is_muted = false;
+                        seat.updated_at = nowIso();
+                        
+                        // Broadcast seats snapshot
+                        io.to(`room_${roomId}`).emit('seats_snapshot', {
+                            room_id: roomId,
+                            seats: voiceSeats.filter(vs => vs.room_id === roomId)
+                        });
+                    }
+                    
+                    // Notify room members
+                    io.to(`room_${roomId}`).emit('user_offline', {
+                        user_id: socket.user.id,
+                        username: socket.user.username,
+                        timestamp: nowIso()
+                    });
+                });
+                
+                // Remove from connected users
+                connectedUsersMap.delete(socket.user.id);
+            }
+            
+        } catch (error) {
+            console.error('Disconnect cleanup error:', error);
         }
     });
 });
 
-// ================== START SERVER ==================
-initializeDefaultData();
+// ================== BOT COMMAND PROCESSING ==================
+function processBotCommand(command, args, user, roomId, socket) {
+    command = command.toLowerCase();
+    
+    // Check for bot commands in the database
+    const roomBots = bots.filter(bot => bot.room_id === roomId);
+    let botResponse = null;
+    
+    for (const bot of roomBots) {
+        const commands = botCommands.filter(cmd => cmd.bot_id === bot.id);
+        
+        for (const cmd of commands) {
+            let match = false;
+            
+            switch (cmd.match_mode) {
+                case 'exact':
+                    match = command === cmd.trigger_text.toLowerCase();
+                    break;
+                case 'starts_with':
+                    match = command.startsWith(cmd.trigger_text.toLowerCase());
+                    break;
+                case 'contains':
+                    match = command.includes(cmd.trigger_text.toLowerCase());
+                    break;
+            }
+            
+            if (match) {
+                botResponse = {
+                    bot_id: bot.id,
+                    bot_name: bot.name,
+                    response_text: cmd.response_text
+                };
+                break;
+            }
+        }
+        
+        if (botResponse) break;
+    }
+    
+    // Default commands if no bot command matched
+    if (!botResponse) {
+        switch (command) {
+            case 'help':
+                botResponse = {
+                    bot_id: 0,
+                    bot_name: 'System Bot',
+                    response_text: `📚 أوامر البوت المتاحة:
+!help - عرض هذه القائمة
+!points - عرض نقاطك
+!users - عدد الأعضاء النشطين
+!time - الوقت الحالي
+!roll - رمي نرد (1-6)
+!weather - حالة الطقس (قريباً)`
+                };
+                break;
+                
+            case 'points':
+                botResponse = {
+                    bot_id: 0,
+                    bot_name: 'System Bot',
+                    response_text: `💰 ${user.username}, لديك ${user.points} نقطة.`
+                };
+                break;
+                
+            case 'users':
+                const onlineCount = connectedUsersMap.size;
+                const totalUsers = users.length;
+                botResponse = {
+                    bot_id: 0,
+                    bot_name: 'System Bot',
+                    response_text: `👥 الأعضاء النشطين: ${onlineCount} من ${totalUsers}`
+                };
+                break;
+                
+            case 'time':
+                const now = new Date();
+                const timeStr = now.toLocaleString('ar-SA', {
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+                botResponse = {
+                    bot_id: 0,
+                    bot_name: 'System Bot',
+                    response_text: `🕒 الوقت الحالي: ${timeStr}`
+                };
+                break;
+                
+            case 'roll':
+                const roll = Math.floor(Math.random() * 6) + 1;
+                botResponse = {
+                    bot_id: 0,
+                    bot_name: 'System Bot',
+                    response_text: `🎲 ${user.username} رمى النرد وحصل على: ${roll}`
+                };
+                break;
+        }
+    }
+    
+    // Send bot response if available
+    if (botResponse) {
+        const botMessage = {
+            id: messages.length + 1,
+            room_id: roomId,
+            user_id: null,
+            username: botResponse.bot_name,
+            text: botResponse.response_text,
+            message_type: 'bot',
+            metadata_json: JSON.stringify({
+                bot_id: botResponse.bot_id,
+                triggered_by: user.id
+            }),
+            edited: false,
+            deleted: false,
+            created_at: nowIso(),
+            updated_at: nowIso()
+        };
+        
+        messages.push(botMessage);
+        
+        // Emit bot message
+        if (socket) {
+            socket.to(`room_${roomId}`).emit('chat', { message: botMessage });
+            socket.emit('chat', { message: botMessage });
+        }
+    }
+}
 
-server.listen(PORT, () => {
-    console.log(`🚀 ProfileHub Server v3.0 is running on port ${PORT}`);
-    console.log(`📡 WebSocket server ready`);
-    console.log(`🔄 REST API available at http://localhost:${PORT}`);
-    console.log(`👨‍💻 Admin user: admin / admin123`);
+// ================== START SERVER ==================
+function startServer() {
+    // Initialize default data
+    initializeDefaultData();
+    
+    // Start server
+    server.listen(PORT, () => {
+        console.log(`
+        ╔══════════════════════════════════════════════╗
+        ║           ProfileHub Server v4.0             ║
+        ║         ✨ Ready for connections ✨           ║
+        ╚══════════════════════════════════════════════╝
+        
+        📡 Server URL: http://localhost:${PORT}
+        📡 WebSocket URL: ws://localhost:${PORT}
+        
+        📊 Statistics:
+        👥 Users: ${users.length}
+        💬 Rooms: ${rooms.length}
+        🖼️ Frames: ${frames.length}
+        💎 Subscriptions: ${subscriptions.length}
+        
+        🔒 Admin Account:
+        👤 Username: admin
+        🔑 Password: admin123
+        🆔 ID: 1
+        
+        ⚠️  IMPORTANT: Change default passwords in production!
+        `);
+    });
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n🛑 Server shutting down...');
+    server.close(() => {
+        console.log('✅ Server stopped');
+        process.exit(0);
+    });
 });
+
+// Start the server
+if (require.main === module) {
+    startServer();
+}
+
+// ================== EXPORTS FOR TESTING ==================
+module.exports = {
+    app,
+    server,
+    io,
+    users,
+    rooms,
+    frames,
+    messages,
+    connectedUsersMap,
+    generateToken,
+    verifyToken,
+    initializeDefaultData,
+    startServer
+};
