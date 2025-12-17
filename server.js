@@ -1,19 +1,18 @@
 /**
  * COMPLETE SERVER FILE - ProfileHub v2.0
- * Express + WebSocket + MySQL + JWT + Full API
+ * Express + Socket.IO + MySQL + JWT + Full API
  * Supports: Chat, Voice Rooms, Frames, Points, Moderation, Bots, Subscriptions
  */
 
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const WebSocket = require("ws");
+const { Server } = require("socket.io");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
-const bcrypt = require("bcrypt");
-const path = require("path");
+const bcrypt = require("bcryptjs");
 
 const app = express();
 app.use(cors({
@@ -130,7 +129,6 @@ async function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "INVALID_TOKEN" });
   }
   
-  // Check if user exists and is not banned
   const user = await dbOne(
     "SELECT id, username, email, is_developer, verified, points, banned, avatar_url, bio, frame_id, created_at FROM users WHERE id = ?",
     [decoded.id]
@@ -1856,32 +1854,18 @@ app.post("/api/admin/users/:id/toggle-verify", authMiddleware, async (req, res) 
   }
 });
 
-// ================== WEBSOCKET SERVER ==================
-const wss = new WebSocket.Server({ server });
+// ================== SOCKET.IO SERVER ==================
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  transports: ["websocket", "polling"]
+});
 
-const clients = new Map();
-const roomClients = new Map();
-
-function broadcastToRoom(roomId, message, excludeUserId = null) {
-  const clientsInRoom = roomClients.get(roomId);
-  if (!clientsInRoom) return;
-  
-  const messageStr = JSON.stringify(message);
-  
-  clientsInRoom.forEach(client => {
-    const clientData = Array.from(clients.values()).find(c => c.ws === client);
-    if (clientData && clientData.userId !== excludeUserId && client.readyState === WebSocket.OPEN) {
-      client.send(messageStr);
-    }
-  });
-}
-
-function sendToUser(userId, message) {
-  const clientData = clients.get(userId);
-  if (clientData && clientData.ws.readyState === WebSocket.OPEN) {
-    clientData.ws.send(JSON.stringify(message));
-  }
-}
+// Store connected users
+const onlineUsers = new Map(); // userId -> socketId
+const userRooms = new Map(); // userId -> Set<roomId>
 
 async function cleanupOldMessages(roomId, limit) {
   try {
@@ -1904,146 +1888,17 @@ async function cleanupOldMessages(roomId, limit) {
   }
 }
 
-wss.on("connection", (ws) => {
-  let userId = null;
-  let userData = null;
-  
-  ws.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-      
-      switch (data.type) {
-        case "auth":
-          await handleAuth(ws, data);
-          break;
-        
-        case "join_room":
-          await handleJoinRoom(ws, data, userId);
-          break;
-        
-        case "leave_room":
-          await handleLeaveRoom(ws, data, userId);
-          break;
-        
-        case "chat":
-          await handleChat(ws, data, userId);
-          break;
-        
-        case "typing":
-          await handleTyping(ws, data, userId);
-          break;
-        
-        case "edit_message":
-          await handleEditMessage(ws, data, userId);
-          break;
-        
-        case "delete_message":
-          await handleDeleteMessage(ws, data, userId);
-          break;
-        
-        case "moderate":
-          await handleModerate(ws, data, userId);
-          break;
-        
-        case "set_label":
-          await handleSetLabel(ws, data, userId);
-          break;
-        
-        case "transfer_owner":
-          await handleTransferOwner(ws, data, userId);
-          break;
-        
-        case "seat_join":
-          await handleSeatJoin(ws, data, userId);
-          break;
-        
-        case "seat_leave":
-          await handleSeatLeave(ws, data, userId);
-          break;
-        
-        case "seat_kick":
-          await handleSeatKick(ws, data, userId);
-          break;
-        
-        case "seat_lock":
-        case "seat_unlock":
-          await handleSeatLock(ws, data, userId);
-          break;
-        
-        case "seat_mute":
-        case "seat_unmute":
-          await handleSeatMute(ws, data, userId);
-          break;
-        
-        case "webrtc_offer":
-        case "webrtc_answer":
-        case "webrtc_ice":
-          await handleWebRTCSignal(ws, data, userId);
-          break;
-        
-        case "ping":
-          ws.send(JSON.stringify({ type: "pong" }));
-          break;
-      }
-    } catch (error) {
-      console.error("WebSocket message error:", error);
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
-    }
-  });
-  
-  ws.on("close", async () => {
-    if (userId && clients.has(userId)) {
-      const clientData = clients.get(userId);
-      
-      if (clientData.rooms) {
-        clientData.rooms.forEach(roomId => {
-          const roomSet = roomClients.get(roomId);
-          if (roomSet) {
-            roomSet.delete(ws);
-            if (roomSet.size === 0) {
-              roomClients.delete(roomId);
-            }
-          }
-        });
-      }
-      
-      if (userData) {
-        try {
-          await pool.execute(
-            "UPDATE voice_seats SET user_id = NULL WHERE user_id = ?",
-            [userId]
-          );
-        } catch (error) {
-          console.error("Error clearing voice seats:", error);
-        }
-      }
-      
-      clients.delete(userId);
-      
-      if (clientData.rooms) {
-        clientData.rooms.forEach(roomId => {
-          broadcastToRoom(roomId, {
-            type: "user_left",
-            user_id: userId,
-            username: userData?.username,
-            room_id: roomId
-          });
-        });
-      }
-    }
-  });
-  
-  async function handleAuth(ws, data) {
-    const token = data.token;
+// Middleware for socket authentication
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
     if (!token) {
-      ws.send(JSON.stringify({ type: "auth", ok: false, error: "NO_TOKEN" }));
-      return;
+      return next(new Error("Authentication error: No token provided"));
     }
     
     const decoded = verifyToken(token);
     if (!decoded) {
-      ws.send(JSON.stringify({ type: "auth", ok: false, error: "INVALID_TOKEN" }));
-      return;
+      return next(new Error("Authentication error: Invalid token"));
     }
     
     const user = await dbOne(
@@ -2052,1031 +1907,602 @@ wss.on("connection", (ws) => {
     );
     
     if (!user || user.banned) {
-      ws.send(JSON.stringify({ type: "auth", ok: false, error: "USER_NOT_FOUND_OR_BANNED" }));
-      return;
+      return next(new Error("Authentication error: User not found or banned"));
     }
     
-    userId = user.id;
-    userData = user;
+    socket.userId = user.id;
+    socket.userData = {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      is_developer: user.is_developer,
+      verified: user.verified,
+      points: user.points
+    };
     
-    clients.set(userId, {
-      ws,
-      rooms: new Set(),
-      userId: user.id,
-      username: user.username
-    });
-    
-    ws.send(JSON.stringify({
-      type: "auth",
-      ok: true,
-      user: {
-        id: user.id,
-        username: user.username,
-        is_developer: user.is_developer,
-        verified: user.verified,
-        points: user.points
-      }
-    }));
+    next();
+  } catch (error) {
+    next(new Error("Authentication error"));
   }
+});
+
+io.on("connection", (socket) => {
+  console.log(`User connected: ${socket.userId} (${socket.userData.username})`);
   
-  async function handleJoinRoom(ws, data, userId) {
-    if (!userId) {
-      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "NOT_AUTHENTICATED" }));
-      return;
-    }
-    
-    const roomId = mustInt(data.room_id);
-    if (!roomId) {
-      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "INVALID_ROOM_ID" }));
-      return;
-    }
-    
-    const room = await dbOne("SELECT * FROM rooms WHERE id = ?", [roomId]);
-    if (!room) {
-      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "ROOM_NOT_FOUND" }));
-      return;
-    }
-    
-    const isBanned = await dbOne(
-      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = TRUE",
-      [roomId, userId]
-    );
-    
-    if (isBanned) {
-      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "BANNED_FROM_ROOM" }));
-      return;
-    }
-    
-    const memberCount = await dbOne(
-      "SELECT COUNT(*) as count FROM room_members WHERE room_id = ? AND is_banned = FALSE",
-      [roomId]
-    );
-    
-    if (memberCount.count >= room.max_members) {
-      ws.send(JSON.stringify({ type: "join_room", ok: false, error: "ROOM_FULL" }));
-      return;
-    }
-    
-    if (room.price_points > 0) {
-      const user = await dbOne("SELECT points FROM users WHERE id = ?", [userId]);
-      if (user.points < room.price_points) {
-        ws.send(JSON.stringify({ type: "join_room", ok: false, error: "INSUFFICIENT_POINTS" }));
+  // Add user to online users
+  onlineUsers.set(socket.userId, socket.id);
+  
+  // Update user last seen
+  pool.execute(
+    "UPDATE users SET last_seen = ? WHERE id = ?",
+    [nowIso(), socket.userId]
+  ).catch(console.error);
+  
+  // Send welcome message
+  socket.emit("welcome", {
+    message: "Connected to ProfileHub Socket.IO server",
+    user: socket.userData
+  });
+  
+  // Handle joining a room
+  socket.on("join_room", async (data) => {
+    try {
+      const { room_id } = data;
+      const roomId = mustInt(room_id);
+      
+      if (!roomId) {
+        socket.emit("error", { message: "Invalid room ID" });
         return;
       }
       
-      await pool.execute(
-        "UPDATE users SET points = points - ? WHERE id = ?",
-        [room.price_points, userId]
+      const room = await dbOne("SELECT * FROM rooms WHERE id = ?", [roomId]);
+      if (!room) {
+        socket.emit("error", { message: "Room not found" });
+        return;
+      }
+      
+      // Check if user is banned from room
+      const isBanned = await dbOne(
+        "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = TRUE",
+        [roomId, socket.userId]
       );
       
-      await pool.execute(
-        "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
-        [userId, -room.price_points, `رسوم الانضمام للغرفة: ${room.name}`]
-      );
-    }
-    
-    const existingMember = await dbOne(
-      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ?",
-      [roomId, userId]
-    );
-    
-    if (!existingMember) {
-      await pool.execute(
-        "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'member')",
-        [roomId, userId]
-      );
+      if (isBanned) {
+        socket.emit("error", { message: "You are banned from this room" });
+        return;
+      }
       
-      await pool.execute(
-        "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-        [roomId, `${userData.username} انضم للغرفة`]
-      );
-    }
-    
-    const clientData = clients.get(userId);
-    if (clientData) {
-      clientData.rooms.add(roomId);
-    }
-    
-    if (!roomClients.has(roomId)) {
-      roomClients.set(roomId, new Set());
-    }
-    roomClients.get(roomId).add(ws);
-    
-    const members = await dbAll(`
-      SELECT rm.*, 
-             u.username, 
-             u.avatar_url,
-             u.is_developer,
-             u.verified,
-             u.points
-      FROM room_members rm
-      LEFT JOIN users u ON rm.user_id = u.id
-      WHERE rm.room_id = ? AND rm.is_banned = FALSE
-    `, [roomId]);
-    
-    const messages = await dbAll(`
-      SELECT m.*, 
-             u.username,
-             u.avatar_url,
-             u.is_developer,
-             u.verified
-      FROM messages m
-      LEFT JOIN users u ON m.user_id = u.id
-      WHERE m.room_id = ? AND m.deleted = FALSE
-      ORDER BY m.id DESC
-      LIMIT 100
-    `, [roomId]);
-    
-    let seats = [];
-    if (room.type === "voice") {
-      seats = await dbAll(
-        "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+      // Check if room is full
+      const memberCount = await dbOne(
+        "SELECT COUNT(*) as count FROM room_members WHERE room_id = ? AND is_banned = FALSE",
         [roomId]
       );
-    }
-    
-    ws.send(JSON.stringify({
-      type: "join_room",
-      ok: true,
-      room: {
-        ...room,
-        members: members.map(m => ({
-          user_id: m.user_id,
-          username: m.username,
-          avatar_url: m.avatar_url,
-          role: m.role,
-          muted_until: m.muted_until,
-          label_text: m.label_text,
-          label_color: m.label_color,
-          is_developer: m.is_developer,
-          verified: m.verified,
-          points: m.points
-        }))
-      },
-      messages: messages.reverse(),
-      seats
-    }));
-    
-    broadcastToRoom(roomId, {
-      type: "user_joined",
-      user: {
-        id: userId,
-        username: userData.username,
-        avatar_url: userData.avatar_url,
-        is_developer: userData.is_developer,
-        verified: userData.verified
+      
+      if (memberCount.count >= room.max_members) {
+        socket.emit("error", { message: "Room is full" });
+        return;
       }
-    }, userId);
-  }
-  
-  async function handleLeaveRoom(ws, data, userId) {
-    if (!userId) {
-      ws.send(JSON.stringify({ type: "error", error: "NOT_AUTHENTICATED" }));
-      return;
-    }
-    
-    const roomId = mustInt(data.room_id);
-    if (!roomId) return;
-    
-    const clientData = clients.get(userId);
-    if (clientData) {
-      clientData.rooms.delete(roomId);
-    }
-    
-    const roomSet = roomClients.get(roomId);
-    if (roomSet) {
-      roomSet.delete(ws);
-      if (roomSet.size === 0) {
-        roomClients.delete(roomId);
-      }
-    }
-    
-    await pool.execute(
-      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-      [roomId, userId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "user_left",
-      user_id: userId,
-      username: userData?.username
-    });
-    
-    ws.send(JSON.stringify({
-      type: "leave_room",
-      ok: true,
-      room_id: roomId
-    }));
-  }
-  
-  async function handleChat(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, text, message_type, metadata } = data;
-    const roomId = mustInt(room_id);
-    
-    if (!roomId || !text || text.trim().length === 0) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE" }));
-      return;
-    }
-    
-    const member = await dbOne(
-      "SELECT * FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
-      [roomId, userId]
-    );
-    
-    if (!member) {
-      ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
-      return;
-    }
-    
-    if (member.muted_until && new Date(member.muted_until) > new Date()) {
-      ws.send(JSON.stringify({ type: "error", error: "USER_MUTED" }));
-      return;
-    }
-    
-    const room = await dbOne(
-      "SELECT settings_json FROM rooms WHERE id = ?",
-      [roomId]
-    );
-    
-    if (room) {
-      const settings = safeJsonParse(room.settings_json) || {};
-      if (settings.chat_locked) {
-        const canModerate = await canModerateRoom(roomId, userId);
-        if (!canModerate) {
-          ws.send(JSON.stringify({ type: "error", error: "CHAT_LOCKED" }));
+      
+      // Check if user has enough points to join (if room has price)
+      if (room.price_points > 0) {
+        const user = await dbOne("SELECT points FROM users WHERE id = ?", [socket.userId]);
+        if (user.points < room.price_points) {
+          socket.emit("error", { message: "Insufficient points to join this room" });
           return;
         }
+        
+        // Deduct points
+        await pool.execute(
+          "UPDATE users SET points = points - ? WHERE id = ?",
+          [room.price_points, socket.userId]
+        );
+        
+        // Record transaction
+        await pool.execute(
+          "INSERT INTO point_transactions (to_user_id, amount, reason) VALUES (?, ?, ?)",
+          [socket.userId, -room.price_points, `رسوم الانضمام للغرفة: ${room.name}`]
+        );
       }
+      
+      // Add user to room members if not already a member
+      const existingMember = await dbOne(
+        "SELECT id FROM room_members WHERE room_id = ? AND user_id = ?",
+        [roomId, socket.userId]
+      );
+      
+      if (!existingMember) {
+        await pool.execute(
+          "INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, 'member')",
+          [roomId, socket.userId]
+        );
+        
+        // Add system message
+        await pool.execute(
+          "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
+          [roomId, `${socket.userData.username} انضم للغرفة`]
+        );
+      }
+      
+      // Join socket room
+      socket.join(`room:${roomId}`);
+      
+      // Update user rooms tracking
+      if (!userRooms.has(socket.userId)) {
+        userRooms.set(socket.userId, new Set());
+      }
+      userRooms.get(socket.userId).add(roomId);
+      
+      // Get room members
+      const members = await dbAll(`
+        SELECT rm.*, 
+               u.username, 
+               u.avatar_url,
+               u.is_developer,
+               u.verified,
+               u.points
+        FROM room_members rm
+        LEFT JOIN users u ON rm.user_id = u.id
+        WHERE rm.room_id = ? AND rm.is_banned = FALSE
+      `, [roomId]);
+      
+      // Get messages
+      const messages = await dbAll(`
+        SELECT m.*, 
+               u.username,
+               u.avatar_url,
+               u.is_developer,
+               u.verified,
+               rm.label_text,
+               rm.label_color
+        FROM messages m
+        LEFT JOIN users u ON m.user_id = u.id
+        LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+        WHERE m.room_id = ? AND m.deleted = FALSE
+        ORDER BY m.id DESC
+        LIMIT 100
+      `, [roomId]);
+      
+      // Get voice seats if voice room
+      let seats = [];
+      if (room.type === "voice") {
+        seats = await dbAll(
+          "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+          [roomId]
+        );
+      }
+      
+      // Send room data to user
+      socket.emit("room_joined", {
+        room: {
+          ...room,
+          members: members.map(m => ({
+            user_id: m.user_id,
+            username: m.username,
+            avatar_url: m.avatar_url,
+            role: m.role,
+            muted_until: m.muted_until,
+            label_text: m.label_text,
+            label_color: m.label_color,
+            is_developer: m.is_developer,
+            verified: m.verified,
+            points: m.points
+          }))
+        },
+        messages: messages.reverse(),
+        seats
+      });
+      
+      // Notify others in the room
+      socket.to(`room:${roomId}`).emit("user_joined", {
+        user: {
+          id: socket.userId,
+          username: socket.userData.username,
+          avatar_url: socket.userData.avatar_url,
+          is_developer: socket.userData.is_developer,
+          verified: socket.userData.verified
+        }
+      });
+      
+    } catch (error) {
+      console.error("Join room error:", error);
+      socket.emit("error", { message: "Server error" });
     }
-    
-    const bots = await dbAll(`
-      SELECT b.*, c.trigger_text, c.response_text, c.match_type
-      FROM bots b
-      LEFT JOIN bot_commands c ON b.id = c.bot_id
-      WHERE b.room_id = ? AND b.enabled = TRUE AND c.enabled = TRUE
-    `, [roomId]);
-    
-    let botResponse = null;
-    for (const bot of bots) {
-      if (!bot.trigger_text || !bot.response_text) continue;
+  });
+  
+  // Handle leaving a room
+  socket.on("leave_room", async (data) => {
+    try {
+      const { room_id } = data;
+      const roomId = mustInt(room_id);
       
-      let shouldRespond = false;
-      const messageText = text.trim().toLowerCase();
-      const triggerText = bot.trigger_text.toLowerCase();
+      if (!roomId) return;
       
-      switch (bot.match_type) {
-        case "exact":
-          shouldRespond = messageText === triggerText;
-          break;
-        case "starts_with":
-          shouldRespond = messageText.startsWith(triggerText);
-          break;
-        case "contains":
-          shouldRespond = messageText.includes(triggerText);
-          break;
+      // Leave socket room
+      socket.leave(`room:${roomId}`);
+      
+      // Update user rooms tracking
+      if (userRooms.has(socket.userId)) {
+        userRooms.get(socket.userId).delete(roomId);
       }
       
-      if (shouldRespond) {
-        botResponse = {
-          bot_id: bot.id,
-          bot_name: bot.name,
-          avatar_url: bot.avatar_url,
-          response: bot.response_text
-        };
-        break;
-      }
+      // Remove from voice seat
+      await pool.execute(
+        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+        [roomId, socket.userId]
+      );
+      
+      // Notify others
+      socket.to(`room:${roomId}`).emit("user_left", {
+        user_id: socket.userId,
+        username: socket.userData.username
+      });
+      
+      socket.emit("room_left", { room_id: roomId });
+      
+    } catch (error) {
+      console.error("Leave room error:", error);
     }
-    
-    const [result] = await pool.execute(
-      `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
-       VALUES (?, ?, ?, ?, ?)`,
-      [
-        roomId,
-        userId,
-        text.trim(),
-        message_type || "text",
-        JSON.stringify(metadata || {})
-      ]
-    );
-    
-    const messageId = result.insertId;
-    
-    const message = await dbOne(`
-      SELECT m.*, 
-             u.username,
-             u.avatar_url,
-             u.is_developer,
-             u.verified,
-             rm.label_text,
-             rm.label_color
-      FROM messages m
-      LEFT JOIN users u ON m.user_id = u.id
-      LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
-      WHERE m.id = ?
-    `, [messageId]);
-    
-    broadcastToRoom(roomId, {
-      type: "chat",
-      message
-    });
-    
-    if (botResponse) {
-      const [botResult] = await pool.execute(
+  });
+  
+  // Handle chat messages
+  socket.on("chat", async (data) => {
+    try {
+      const { room_id, text, message_type, metadata } = data;
+      const roomId = mustInt(room_id);
+      
+      if (!roomId || !text || text.trim().length === 0) {
+        socket.emit("error", { message: "Invalid message" });
+        return;
+      }
+      
+      // Check if user is member of room
+      const member = await dbOne(
+        "SELECT * FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+        [roomId, socket.userId]
+      );
+      
+      if (!member) {
+        socket.emit("error", { message: "You are not a member of this room" });
+        return;
+      }
+      
+      // Check if user is muted
+      if (member.muted_until && new Date(member.muted_until) > new Date()) {
+        socket.emit("error", { message: "You are muted" });
+        return;
+      }
+      
+      // Check if chat is locked
+      const room = await dbOne(
+        "SELECT settings_json FROM rooms WHERE id = ?",
+        [roomId]
+      );
+      
+      if (room) {
+        const settings = safeJsonParse(room.settings_json) || {};
+        if (settings.chat_locked) {
+          const canModerate = await canModerateRoom(roomId, socket.userId);
+          if (!canModerate) {
+            socket.emit("error", { message: "Chat is locked" });
+            return;
+          }
+        }
+      }
+      
+      // Process bot commands
+      const bots = await dbAll(`
+        SELECT b.*, c.trigger_text, c.response_text, c.match_type
+        FROM bots b
+        LEFT JOIN bot_commands c ON b.id = c.bot_id
+        WHERE b.room_id = ? AND b.enabled = TRUE AND c.enabled = TRUE
+      `, [roomId]);
+      
+      let botResponse = null;
+      for (const bot of bots) {
+        if (!bot.trigger_text || !bot.response_text) continue;
+        
+        let shouldRespond = false;
+        const messageText = text.trim().toLowerCase();
+        const triggerText = bot.trigger_text.toLowerCase();
+        
+        switch (bot.match_type) {
+          case "exact":
+            shouldRespond = messageText === triggerText;
+            break;
+          case "starts_with":
+            shouldRespond = messageText.startsWith(triggerText);
+            break;
+          case "contains":
+            shouldRespond = messageText.includes(triggerText);
+            break;
+        }
+        
+        if (shouldRespond) {
+          botResponse = {
+            bot_id: bot.id,
+            bot_name: bot.name,
+            avatar_url: bot.avatar_url,
+            response: bot.response_text
+          };
+          break;
+        }
+      }
+      
+      // Insert message
+      const [result] = await pool.execute(
         `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
-         VALUES (?, 0, ?, 'bot', ?)`,
+         VALUES (?, ?, ?, ?, ?)`,
         [
           roomId,
-          botResponse.response,
-          JSON.stringify({
-            bot_id: botResponse.bot_id,
-            bot_name: botResponse.bot_name,
-            avatar_url: botResponse.avatar_url
-          })
+          socket.userId,
+          text.trim(),
+          message_type || "text",
+          JSON.stringify(metadata || {})
         ]
       );
       
-      const botMessageId = botResult.insertId;
-      const botMessage = await dbOne(
-        "SELECT * FROM messages WHERE id = ?",
-        [botMessageId]
-      );
+      const messageId = result.insertId;
       
-      broadcastToRoom(roomId, {
-        type: "chat",
-        message: {
-          ...botMessage,
-          username: botResponse.bot_name,
-          avatar_url: botResponse.avatar_url,
-          is_developer: false,
-          verified: false
-        }
-      });
-    }
-    
-    if (room) {
-      const settings = safeJsonParse(room.settings_json) || {};
-      if (settings.auto_delete_limit > 0) {
-        await cleanupOldMessages(roomId, settings.auto_delete_limit);
+      // Get message with user info
+      const message = await dbOne(`
+        SELECT m.*, 
+               u.username,
+               u.avatar_url,
+               u.is_developer,
+               u.verified,
+               rm.label_text,
+               rm.label_color
+        FROM messages m
+        LEFT JOIN users u ON m.user_id = u.id
+        LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
+        WHERE m.id = ?
+      `, [messageId]);
+      
+      // Broadcast message to room
+      io.to(`room:${roomId}`).emit("chat", { message });
+      
+      // Send bot response if any
+      if (botResponse) {
+        // Insert bot message
+        const [botResult] = await pool.execute(
+          `INSERT INTO messages (room_id, user_id, text, message_type, metadata_json)
+           VALUES (?, 0, ?, 'bot', ?)`,
+          [
+            roomId,
+            botResponse.response,
+            JSON.stringify({
+              bot_id: botResponse.bot_id,
+              bot_name: botResponse.bot_name,
+              avatar_url: botResponse.avatar_url
+            })
+          ]
+        );
+        
+        const botMessageId = botResult.insertId;
+        const botMessage = await dbOne(
+          "SELECT * FROM messages WHERE id = ?",
+          [botMessageId]
+        );
+        
+        io.to(`room:${roomId}`).emit("chat", {
+          message: {
+            ...botMessage,
+            username: botResponse.bot_name,
+            avatar_url: botResponse.avatar_url,
+            is_developer: false,
+            verified: false
+          }
+        });
       }
-    }
-  }
-  
-  async function handleTyping(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, is_typing } = data;
-    const roomId = mustInt(room_id);
-    
-    broadcastToRoom(roomId, {
-      type: "typing",
-      user_id: userId,
-      username: userData?.username,
-      is_typing: !!is_typing
-    }, userId);
-  }
-  
-  async function handleEditMessage(ws, data, userId) {
-    if (!userId) return;
-    
-    const { message_id, text } = data;
-    const messageId = mustInt(message_id);
-    
-    if (!messageId || !text || text.trim().length === 0) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const message = await dbOne(
-      "SELECT * FROM messages WHERE id = ? AND deleted = FALSE",
-      [messageId]
-    );
-    
-    if (!message) {
-      ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
-      return;
-    }
-    
-    const isOwner = message.user_id === userId;
-    const canModerate = await canModerateRoom(message.room_id, userId);
-    
-    if (!isOwner && !canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE messages SET text = ?, edited = TRUE, updated_at = ? WHERE id = ?",
-      [text.trim(), nowIso(), messageId]
-    );
-    
-    const updatedMessage = await dbOne(`
-      SELECT m.*, 
-             u.username,
-             u.avatar_url,
-             u.is_developer,
-             u.verified,
-             rm.label_text,
-             rm.label_color
-      FROM messages m
-      LEFT JOIN users u ON m.user_id = u.id
-      LEFT JOIN room_members rm ON m.room_id = rm.room_id AND m.user_id = rm.user_id
-      WHERE m.id = ?
-    `, [messageId]);
-    
-    broadcastToRoom(message.room_id, {
-      type: "edit_message",
-      message: updatedMessage
-    });
-  }
-  
-  async function handleDeleteMessage(ws, data, userId) {
-    if (!userId) return;
-    
-    const { message_id, reason } = data;
-    const messageId = mustInt(message_id);
-    
-    if (!messageId) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_MESSAGE_ID" }));
-      return;
-    }
-    
-    const message = await dbOne("SELECT * FROM messages WHERE id = ?", [messageId]);
-    
-    if (!message) {
-      ws.send(JSON.stringify({ type: "error", error: "MESSAGE_NOT_FOUND" }));
-      return;
-    }
-    
-    const isOwner = message.user_id === userId;
-    const canModerate = await canModerateRoom(message.room_id, userId);
-    
-    if (!isOwner && !canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE messages SET deleted = TRUE, deleted_by = ?, updated_at = ? WHERE id = ?",
-      [userId, nowIso(), messageId]
-    );
-    
-    broadcastToRoom(message.room_id, {
-      type: "delete_message",
-      message_id: messageId,
-      deleted_by: userId,
-      reason: reason || ""
-    });
-  }
-  
-  async function handleModerate(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, action, target_user_id, duration, reason } = data;
-    const roomId = mustInt(room_id);
-    const targetUserId = mustInt(target_user_id);
-    
-    if (!roomId || !action || !targetUserId) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const canModerate = await canModerateRoom(roomId, userId);
-    if (!canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    if (targetUserId === userId) {
-      ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_SELF" }));
-      return;
-    }
-    
-    const targetMember = await getRoomMember(roomId, targetUserId);
-    if (!targetMember) {
-      ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
-      return;
-    }
-    
-    const userMember = await getRoomMember(roomId, userId);
-    const userRank = roleRank(userMember?.role);
-    const targetRank = roleRank(targetMember.role);
-    
-    if (targetRank >= userRank) {
-      ws.send(JSON.stringify({ type: "error", error: "CANNOT_MODERATE_HIGHER_RANK" }));
-      return;
-    }
-    
-    let message = "";
-    
-    switch (action) {
-      case "mute":
-        const muteMinutes = mustInt(duration, 5);
-        const muteUntil = new Date(Date.now() + muteMinutes * 60000);
-        
-        await pool.execute(
-          "UPDATE room_members SET muted_until = ? WHERE room_id = ? AND user_id = ?",
-          [muteUntil, roomId, targetUserId]
-        );
-        
-        message = `تم كتم ${targetMember.username} لمدة ${muteMinutes} دقيقة${reason ? ` - السبب: ${reason}` : ''}`;
-        break;
-        
-      case "unmute":
-        await pool.execute(
-          "UPDATE room_members SET muted_until = NULL WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        message = `تم إلغاء كتم ${targetMember.username}`;
-        break;
-        
-      case "ban":
-        await pool.execute(
-          "UPDATE room_members SET is_banned = TRUE WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        await pool.execute(
-          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        const targetClient = clients.get(targetUserId);
-        if (targetClient) {
-          targetClient.ws.send(JSON.stringify({
-            type: "banned",
-            room_id: roomId,
-            reason: reason || ""
-          }));
-          
-          targetClient.rooms.delete(roomId);
-        }
-        
-        message = `تم حظر ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
-        break;
-        
-      case "unban":
-        await pool.execute(
-          "UPDATE room_members SET is_banned = FALSE WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        message = `تم إلغاء حظر ${targetMember.username}`;
-        break;
-        
-      case "kick":
-        await pool.execute(
-          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        const targetClient2 = clients.get(targetUserId);
-        if (targetClient2) {
-          targetClient2.ws.send(JSON.stringify({
-            type: "kicked",
-            room_id: roomId,
-            reason: reason || ""
-          }));
-          
-          targetClient2.rooms.delete(roomId);
-        }
-        
-        message = `تم طرد ${targetMember.username} من الغرفة${reason ? ` - السبب: ${reason}` : ''}`;
-        break;
-        
-      case "promote":
-        await pool.execute(
-          "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        message = `تم ترقية ${targetMember.username} إلى مشرف`;
-        break;
-        
-      case "demote":
-        await pool.execute(
-          "UPDATE room_members SET role = 'member' WHERE room_id = ? AND user_id = ?",
-          [roomId, targetUserId]
-        );
-        
-        message = `تم خفض رتبة ${targetMember.username} إلى عضو`;
-        break;
-    }
-    
-    if (message) {
-      await pool.execute(
-        "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-        [roomId, message]
-      );
       
-      const systemMessage = await dbOne(`
-        SELECT * FROM messages 
-        WHERE room_id = ? 
-        ORDER BY id DESC 
-        LIMIT 1
-      `, [roomId]);
-      
-      broadcastToRoom(roomId, {
-        type: "chat",
-        message: systemMessage
-      });
-    }
-    
-    const members = await dbAll(`
-      SELECT rm.*, 
-             u.username, 
-             u.avatar_url,
-             u.is_developer,
-             u.verified
-      FROM room_members rm
-      LEFT JOIN users u ON rm.user_id = u.id
-      WHERE rm.room_id = ? AND rm.is_banned = FALSE
-    `, [roomId]);
-    
-    broadcastToRoom(roomId, {
-      type: "members_update",
-      members: members.map(m => ({
-        user_id: m.user_id,
-        username: m.username,
-        avatar_url: m.avatar_url,
-        role: m.role,
-        muted_until: m.muted_until,
-        label_text: m.label_text,
-        label_color: m.label_color,
-        is_developer: m.is_developer,
-        verified: m.verified
-      }))
-    });
-  }
-  
-  async function handleSetLabel(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, target_user_id, label_text, label_color } = data;
-    const roomId = mustInt(room_id);
-    const targetUserId = mustInt(target_user_id);
-    
-    if (!roomId || !targetUserId) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const canModerate = await canModerateRoom(roomId, userId);
-    if (!canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE room_members SET label_text = ?, label_color = ? WHERE room_id = ? AND user_id = ?",
-      [label_text || null, label_color || "#007AFF", roomId, targetUserId]
-    );
-    
-    const member = await dbOne(`
-      SELECT rm.*, 
-             u.username, 
-             u.avatar_url,
-             u.is_developer,
-             u.verified
-      FROM room_members rm
-      LEFT JOIN users u ON rm.user_id = u.id
-      WHERE rm.room_id = ? AND rm.user_id = ?
-    `, [roomId, targetUserId]);
-    
-    broadcastToRoom(roomId, {
-      type: "member_update",
-      member: {
-        user_id: member.user_id,
-        username: member.username,
-        avatar_url: member.avatar_url,
-        role: member.role,
-        muted_until: member.muted_until,
-        label_text: member.label_text,
-        label_color: member.label_color,
-        is_developer: member.is_developer,
-        verified: member.verified
+      // Auto-delete old messages if limit is set
+      if (room) {
+        const settings = safeJsonParse(room.settings_json) || {};
+        if (settings.auto_delete_limit > 0) {
+          await cleanupOldMessages(roomId, settings.auto_delete_limit);
+        }
       }
-    });
-  }
+      
+    } catch (error) {
+      console.error("Chat error:", error);
+      socket.emit("error", { message: "Server error" });
+    }
+  });
   
-  async function handleTransferOwner(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, new_owner_id } = data;
-    const roomId = mustInt(room_id);
-    const newOwnerId = mustInt(new_owner_id);
-    
-    if (!roomId || !newOwnerId) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
+  // Handle typing indicator
+  socket.on("typing", async (data) => {
+    try {
+      const { room_id, is_typing } = data;
+      const roomId = mustInt(room_id);
+      
+      if (!roomId) return;
+      
+      socket.to(`room:${roomId}`).emit("typing", {
+        user_id: socket.userId,
+        username: socket.userData.username,
+        is_typing: !!is_typing
+      });
+      
+    } catch (error) {
+      console.error("Typing error:", error);
     }
-    
-    const isOwner = await isRoomOwner(roomId, userId);
-    if (!isOwner) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    const newOwnerMember = await getRoomMember(roomId, newOwnerId);
-    if (!newOwnerMember) {
-      ws.send(JSON.stringify({ type: "error", error: "USER_NOT_IN_ROOM" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE rooms SET owner_id = ? WHERE id = ?",
-      [newOwnerId, roomId]
-    );
-    
-    await pool.execute(
-      "UPDATE room_members SET role = 'owner' WHERE room_id = ? AND user_id = ?",
-      [roomId, newOwnerId]
-    );
-    
-    await pool.execute(
-      "UPDATE room_members SET role = 'admin' WHERE room_id = ? AND user_id = ?",
-      [roomId, userId]
-    );
-    
-    await pool.execute(
-      "INSERT INTO messages (room_id, user_id, text, message_type) VALUES (?, 0, ?, 'system')",
-      [roomId, `تم نقل ملكية الغرفة إلى ${newOwnerMember.username}`]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "owner_transferred",
-      old_owner_id: userId,
-      new_owner_id: newOwnerId
-    });
-  }
+  });
   
-  async function handleSeatJoin(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, seat_index } = data;
-    const roomId = mustInt(room_id);
-    const seatIndex = mustInt(seat_index);
-    
-    if (!roomId || !seatIndex) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const isMember = await dbOne(
-      "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
-      [roomId, userId]
-    );
-    
-    if (!isMember) {
-      ws.send(JSON.stringify({ type: "error", error: "NOT_ROOM_MEMBER" }));
-      return;
-    }
-    
-    const room = await dbOne("SELECT type FROM rooms WHERE id = ?", [roomId]);
-    if (!room || room.type !== "voice") {
-      ws.send(JSON.stringify({ type: "error", error: "NOT_VOICE_ROOM" }));
-      return;
-    }
-    
-    const seat = await dbOne(
-      "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
-      [roomId, seatIndex]
-    );
-    
-    if (!seat) {
-      ws.send(JSON.stringify({ type: "error", error: "SEAT_NOT_FOUND" }));
-      return;
-    }
-    
-    if (seat.user_id !== null && seat.user_id !== userId) {
-      ws.send(JSON.stringify({ type: "error", error: "SEAT_OCCUPIED" }));
-      return;
-    }
-    
-    if (seat.is_locked) {
-      ws.send(JSON.stringify({ type: "error", error: "SEAT_LOCKED" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-      [roomId, userId]
-    );
-    
-    await pool.execute(
-      "UPDATE voice_seats SET user_id = ? WHERE room_id = ? AND seat_index = ?",
-      [userId, roomId, seatIndex]
-    );
-    
-    const seats = await dbAll(
-      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "seats_update",
-      seats
-    });
-  }
-  
-  async function handleSeatLeave(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, seat_index } = data;
-    const roomId = mustInt(room_id);
-    const seatIndex = mustInt(seat_index);
-    
-    if (!roomId) return;
-    
-    if (seatIndex) {
-      await pool.execute(
-        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ? AND user_id = ?",
-        [roomId, seatIndex, userId]
+  // Handle voice seat operations
+  socket.on("seat_join", async (data) => {
+    try {
+      const { room_id, seat_index } = data;
+      const roomId = mustInt(room_id);
+      const seatIndex = mustInt(seat_index);
+      
+      if (!roomId || !seatIndex) {
+        socket.emit("error", { message: "Invalid parameters" });
+        return;
+      }
+      
+      // Check if user is room member
+      const isMember = await dbOne(
+        "SELECT id FROM room_members WHERE room_id = ? AND user_id = ? AND is_banned = FALSE",
+        [roomId, socket.userId]
       );
-    } else {
-      await pool.execute(
-        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
-        [roomId, userId]
-      );
-    }
-    
-    const seats = await dbAll(
-      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "seats_update",
-      seats
-    });
-  }
-  
-  async function handleSeatKick(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, seat_index } = data;
-    const roomId = mustInt(room_id);
-    const seatIndex = mustInt(seat_index);
-    
-    if (!roomId || !seatIndex) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const canModerate = await canModerateRoom(roomId, userId);
-    if (!canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    const seat = await dbOne(
-      "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
-      [roomId, seatIndex]
-    );
-    
-    if (!seat || !seat.user_id) {
-      ws.send(JSON.stringify({ type: "error", error: "SEAT_EMPTY" }));
-      return;
-    }
-    
-    await pool.execute(
-      "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
-      [roomId, seatIndex]
-    );
-    
-    sendToUser(seat.user_id, {
-      type: "seat_kicked",
-      room_id: roomId,
-      seat_index: seatIndex
-    });
-    
-    const seats = await dbAll(
-      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "seats_update",
-      seats
-    });
-  }
-  
-  async function handleSeatLock(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, seat_index } = data;
-    const roomId = mustInt(room_id);
-    const seatIndex = mustInt(seat_index);
-    
-    if (!roomId || !seatIndex) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const canModerate = await canModerateRoom(roomId, userId);
-    if (!canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    const action = data.type;
-    const isLocking = action === 'seat_lock';
-    
-    await pool.execute(
-      "UPDATE voice_seats SET is_locked = ? WHERE room_id = ? AND seat_index = ?",
-      [isLocking ? 1 : 0, roomId, seatIndex]
-    );
-    
-    if (isLocking) {
+      
+      if (!isMember) {
+        socket.emit("error", { message: "You are not a member of this room" });
+        return;
+      }
+      
+      // Check if room is voice room
+      const room = await dbOne("SELECT type FROM rooms WHERE id = ?", [roomId]);
+      if (!room || room.type !== "voice") {
+        socket.emit("error", { message: "This is not a voice room" });
+        return;
+      }
+      
+      // Check if seat exists and is available
       const seat = await dbOne(
         "SELECT * FROM voice_seats WHERE room_id = ? AND seat_index = ?",
         [roomId, seatIndex]
       );
       
-      if (seat && seat.user_id) {
+      if (!seat) {
+        socket.emit("error", { message: "Seat not found" });
+        return;
+      }
+      
+      if (seat.user_id !== null && seat.user_id !== socket.userId) {
+        socket.emit("error", { message: "Seat is occupied" });
+        return;
+      }
+      
+      if (seat.is_locked) {
+        socket.emit("error", { message: "Seat is locked" });
+        return;
+      }
+      
+      // Remove user from any other seat
+      await pool.execute(
+        "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+        [roomId, socket.userId]
+      );
+      
+      // Occupy seat
+      await pool.execute(
+        "UPDATE voice_seats SET user_id = ? WHERE room_id = ? AND seat_index = ?",
+        [socket.userId, roomId, seatIndex]
+      );
+      
+      // Get updated seats
+      const seats = await dbAll(
+        "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+        [roomId]
+      );
+      
+      // Broadcast seat update
+      io.to(`room:${roomId}`).emit("seats_update", { seats });
+      
+    } catch (error) {
+      console.error("Seat join error:", error);
+      socket.emit("error", { message: "Server error" });
+    }
+  });
+  
+  socket.on("seat_leave", async (data) => {
+    try {
+      const { room_id, seat_index } = data;
+      const roomId = mustInt(room_id);
+      const seatIndex = mustInt(seat_index);
+      
+      if (!roomId) return;
+      
+      if (seatIndex) {
         await pool.execute(
-          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ?",
-          [roomId, seatIndex]
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND seat_index = ? AND user_id = ?",
+          [roomId, seatIndex, socket.userId]
         );
+      } else {
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, socket.userId]
+        );
+      }
+      
+      const seats = await dbAll(
+        "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
+        [roomId]
+      );
+      
+      io.to(`room:${roomId}`).emit("seats_update", { seats });
+      
+    } catch (error) {
+      console.error("Seat leave error:", error);
+    }
+  });
+  
+  // Handle WebRTC signaling
+  socket.on("webrtc_offer", (data) => {
+    const { target_user_id, offer } = data;
+    const targetSocketId = onlineUsers.get(target_user_id);
+    
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("webrtc_offer", {
+        from_user_id: socket.userId,
+        offer
+      });
+    }
+  });
+  
+  socket.on("webrtc_answer", (data) => {
+    const { target_user_id, answer } = data;
+    const targetSocketId = onlineUsers.get(target_user_id);
+    
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("webrtc_answer", {
+        from_user_id: socket.userId,
+        answer
+      });
+    }
+  });
+  
+  socket.on("webrtc_ice_candidate", (data) => {
+    const { target_user_id, candidate } = data;
+    const targetSocketId = onlineUsers.get(target_user_id);
+    
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("webrtc_ice_candidate", {
+        from_user_id: socket.userId,
+        candidate
+      });
+    }
+  });
+  
+  // Handle disconnection
+  socket.on("disconnect", async () => {
+    console.log(`User disconnected: ${socket.userId} (${socket.userData.username})`);
+    
+    // Remove from online users
+    onlineUsers.delete(socket.userId);
+    
+    // Remove user from all rooms and clear voice seats
+    if (userRooms.has(socket.userId)) {
+      const rooms = userRooms.get(socket.userId);
+      
+      for (const roomId of rooms) {
+        // Clear voice seats
+        await pool.execute(
+          "UPDATE voice_seats SET user_id = NULL WHERE room_id = ? AND user_id = ?",
+          [roomId, socket.userId]
+        ).catch(console.error);
         
-        sendToUser(seat.user_id, {
-          type: "seat_locked_kick",
-          room_id: roomId,
-          seat_index: seatIndex
+        // Notify room members
+        io.to(`room:${roomId}`).emit("user_left", {
+          user_id: socket.userId,
+          username: socket.userData.username
         });
       }
+      
+      userRooms.delete(socket.userId);
     }
-    
-    const seats = await dbAll(
-      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "seats_update",
-      seats
-    });
-  }
-  
-  async function handleSeatMute(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, seat_index } = data;
-    const roomId = mustInt(room_id);
-    const seatIndex = mustInt(seat_index);
-    
-    if (!roomId || !seatIndex) {
-      ws.send(JSON.stringify({ type: "error", error: "INVALID_PARAMETERS" }));
-      return;
-    }
-    
-    const canModerate = await canModerateRoom(roomId, userId);
-    if (!canModerate) {
-      ws.send(JSON.stringify({ type: "error", error: "PERMISSION_DENIED" }));
-      return;
-    }
-    
-    const action = data.type;
-    const isMuting = action === 'seat_mute';
-    
-    await pool.execute(
-      "UPDATE voice_seats SET is_muted = ? WHERE room_id = ? AND seat_index = ?",
-      [isMuting ? 1 : 0, roomId, seatIndex]
-    );
-    
-    const seats = await dbAll(
-      "SELECT * FROM voice_seats WHERE room_id = ? ORDER BY seat_index ASC",
-      [roomId]
-    );
-    
-    broadcastToRoom(roomId, {
-      type: "seats_update",
-      seats
-    });
-  }
-  
-  async function handleWebRTCSignal(ws, data, userId) {
-    if (!userId) return;
-    
-    const { room_id, target_user_id, signal } = data;
-    const roomId = mustInt(room_id);
-    const targetUserId = mustInt(target_user_id);
-    
-    if (!roomId || !targetUserId || !signal) return;
-    
-    sendToUser(targetUserId, {
-      type: data.type,
-      from_user_id: userId,
-      signal: signal
-    });
-  }
-  
-  ws.send(JSON.stringify({
-    type: "welcome",
-    message: "Connected to ProfileHub WebSocket server"
-  }));
+  });
 });
 
 // ================== ERROR HANDLING ==================
@@ -3100,7 +2526,7 @@ async function startServer() {
   
   server.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
-    console.log(`🌐 WebSocket server ready`);
+    console.log(`🌐 Socket.IO server ready`);
     console.log(`📊 Database: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
   });
 }
@@ -3113,13 +2539,11 @@ process.on("SIGINT", async () => {
     await pool.end();
   }
   
-  wss.close(() => {
-    console.log("WebSocket server closed");
+  io.close(() => {
+    console.log("Socket.IO server closed");
     process.exit(0);
   });
 });
 
 // Start the server
-if (require.main === module) {
-  startServer();
-}
+startServer();
