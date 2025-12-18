@@ -45,6 +45,7 @@ let subscriptions = [];
 let userSubscriptions = [];
 let paymentMethods = [];
 let notifications = [];
+let voiceCalls = [];
 
 // ================== INITIALIZE DEFAULT DATA ==================
 function initializeDefaultData() {
@@ -412,7 +413,48 @@ function initializeDefaultData() {
     console.log(`🖼️ Frames: ${frames.length}`);
     console.log(`💎 Subscriptions: ${subscriptions.length}`);
 }
+// ================== VOICE CALL UTILITIES ==================
 
+// Generate unique room ID for voice calls
+function generateVoiceRoomId() {
+    return `voice_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// Track active voice calls
+const activeVoiceCalls = new Map();
+
+// Voice call cleanup function
+function cleanupVoiceCall(roomId) {
+    try {
+        // Free all seats in this room
+        voiceSeats.forEach(seat => {
+            if (seat.room_id === roomId) {
+                seat.user_id = null;
+                seat.is_muted = false;
+                seat.updated_at = nowIso();
+            }
+        });
+        
+        // Remove from active calls
+        activeVoiceCalls.delete(roomId);
+        
+        console.log(`✅ تم تنظيف مكالمة الصوت في الغرفة ${roomId}`);
+    } catch (error) {
+        console.error('❌ خطأ في تنظيف المكالمة الصوتية:', error);
+    }
+}
+
+// Schedule periodic cleanup of inactive voice calls
+setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, callInfo] of activeVoiceCalls.entries()) {
+        // If call has been inactive for more than 5 minutes, clean it up
+        if (now - callInfo.lastActivity > 5 * 60 * 1000) {
+            cleanupVoiceCall(roomId);
+            console.log(`🧹 تمت إزالة المكالمة غير النشطة: ${roomId}`);
+        }
+    }
+}, 60 * 1000); // Check every minute
 // ================== UTILITY FUNCTIONS ==================
 function generateToken(user) {
     return jwt.sign(
@@ -1137,7 +1179,98 @@ app.post('/api/frames/select', authMiddleware, (req, res) => {
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
+// ===== Voice Call Routes =====
+app.post('/api/rooms/:id/start-call', authMiddleware, (req, res) => {
+    try {
+        const roomId = mustInt(req.params.id);
+        
+        const room = rooms.find(r => r.id === roomId);
+        if (!room) {
+            return res.status(404).json({ ok: false, error: 'ROOM_NOT_FOUND' });
+        }
+        
+        // Check if user is room member
+        const isMember = roomMembers.some(rm => 
+            rm.room_id === roomId && rm.user_id === req.user.id && !rm.is_banned
+        );
+        
+        if (!isMember) {
+            return res.status(403).json({ ok: false, error: 'NOT_ROOM_MEMBER' });
+        }
+        
+        // Check if room supports voice
+        if (room.type !== 'voice') {
+            return res.status(400).json({ ok: false, error: 'NOT_VOICE_ROOM' });
+        }
+        
+        res.json({
+            ok: true,
+            message: 'Voice call started successfully',
+            room_id: roomId,
+            caller_id: req.user.id,
+            caller_name: req.user.username
+        });
+        
+    } catch (error) {
+        console.error('Start call error:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
 
+app.post('/api/voice/end-call', authMiddleware, (req, res) => {
+    try {
+        const { room_id } = req.body;
+        const roomId = mustInt(room_id);
+        
+        // Free all seats occupied by this user
+        voiceSeats.forEach(seat => {
+            if (seat.room_id === roomId && seat.user_id === req.user.id) {
+                seat.user_id = null;
+                seat.is_muted = false;
+                seat.updated_at = nowIso();
+            }
+        });
+        
+        res.json({
+            ok: true,
+            message: 'Call ended successfully'
+        });
+        
+    } catch (error) {
+        console.error('End call error:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
+
+app.get('/api/rooms/:id/voice-users', authMiddleware, (req, res) => {
+    try {
+        const roomId = mustInt(req.params.id);
+        
+        // Get users currently in voice seats
+        const voiceUsers = voiceSeats
+            .filter(vs => vs.room_id === roomId && vs.user_id)
+            .map(vs => {
+                const user = users.find(u => u.id === vs.user_id);
+                return {
+                    user_id: vs.user_id,
+                    username: user?.username,
+                    avatar_url: user?.avatar_url,
+                    seat_index: vs.seat_index,
+                    is_muted: vs.is_muted,
+                    is_locked: vs.is_locked
+                };
+            });
+        
+        res.json({
+            ok: true,
+            voice_users: voiceUsers
+        });
+        
+    } catch (error) {
+        console.error('Get voice users error:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
 // ===== Points System =====
 app.post('/api/points/grant', authMiddleware, (req, res) => {
     try {
@@ -1826,7 +1959,426 @@ io.on('connection', (socket) => {
         user_id: socket.user.id,
         username: socket.user.username
     });
-    
+// ===== Enhanced WebRTC Events =====
+socket.on('webrtc_offer', (data) => {
+    try {
+        const { room_id, to_user_id, sdp, call_type } = data;
+        const roomId = mustInt(room_id);
+        const toUserId = mustInt(to_user_id);
+        
+        // Forward offer to target user
+        const targetConn = connectedUsersMap.get(toUserId);
+        if (targetConn) {
+            io.to(targetConn.socketId).emit('webrtc_offer', {
+                room_id: roomId,
+                from_user_id: socket.user.id,
+                from_username: socket.user.username,
+                sdp: sdp,
+                call_type: call_type || 'voice',
+                timestamp: nowIso()
+            });
+            
+            // Track active call
+            if (!activeVoiceCalls.has(roomId)) {
+                activeVoiceCalls.set(roomId, {
+                    participants: new Set([socket.user.id, toUserId]),
+                    startTime: nowIso(),
+                    lastActivity: Date.now(),
+                    type: call_type || 'voice'
+                });
+            } else {
+                const callInfo = activeVoiceCalls.get(roomId);
+                callInfo.participants.add(socket.user.id);
+                callInfo.participants.add(toUserId);
+                callInfo.lastActivity = Date.now();
+            }
+        }
+        
+    } catch (error) {
+        console.error('WebRTC offer error:', error);
+        socket.emit('webrtc_error', { error: 'Failed to send offer' });
+    }
+});
+
+socket.on('webrtc_answer', (data) => {
+    try {
+        const { room_id, to_user_id, sdp } = data;
+        const roomId = mustInt(room_id);
+        const toUserId = mustInt(to_user_id);
+        
+        // Forward answer to target user
+        const targetConn = connectedUsersMap.get(toUserId);
+        if (targetConn) {
+            io.to(targetConn.socketId).emit('webrtc_answer', {
+                room_id: roomId,
+                from_user_id: socket.user.id,
+                sdp: sdp,
+                timestamp: nowIso()
+            });
+            
+            // Update call activity
+            if (activeVoiceCalls.has(roomId)) {
+                const callInfo = activeVoiceCalls.get(roomId);
+                callInfo.lastActivity = Date.now();
+                callInfo.participants.add(socket.user.id);
+            }
+        }
+        
+    } catch (error) {
+        console.error('WebRTC answer error:', error);
+        socket.emit('webrtc_error', { error: 'Failed to send answer' });
+    }
+});
+
+socket.on('webrtc_ice', (data) => {
+    try {
+        const { room_id, to_user_id, candidate } = data;
+        const roomId = mustInt(room_id);
+        const toUserId = mustInt(to_user_id);
+        
+        // Forward ICE candidate to target user
+        const targetConn = connectedUsersMap.get(toUserId);
+        if (targetConn) {
+            io.to(targetConn.socketId).emit('webrtc_ice', {
+                room_id: roomId,
+                from_user_id: socket.user.id,
+                candidate: candidate,
+                timestamp: nowIso()
+            });
+            
+            // Update call activity
+            if (activeVoiceCalls.has(roomId)) {
+                activeVoiceCalls.get(roomId).lastActivity = Date.now();
+            }
+        }
+        
+    } catch (error) {
+        console.error('WebRTC ICE error:', error);
+        socket.emit('webrtc_error', { error: 'Failed to send ICE candidate' });
+    }
+});
+
+socket.on('webrtc_leave', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Remove user from active call
+        if (activeVoiceCalls.has(roomId)) {
+            const callInfo = activeVoiceCalls.get(roomId);
+            callInfo.participants.delete(socket.user.id);
+            
+            // Notify other participants
+            callInfo.participants.forEach(participantId => {
+                const participantConn = connectedUsersMap.get(participantId);
+                if (participantConn) {
+                    io.to(participantConn.socketId).emit('user_left_call', {
+                        room_id: roomId,
+                        user_id: socket.user.id,
+                        username: socket.user.username,
+                        timestamp: nowIso()
+                    });
+                }
+            });
+            
+            // If no participants left, cleanup
+            if (callInfo.participants.size === 0) {
+                cleanupVoiceCall(roomId);
+            }
+        }
+        
+    } catch (error) {
+        console.error('WebRTC leave error:', error);
+    }
+});
+// ===== Call Management Events =====
+socket.on('incoming_call_response', (data) => {
+    try {
+        const { from_user_id, accepted, room_id } = data;
+        const fromUserId = mustInt(from_user_id);
+        const roomId = mustInt(room_id);
+        
+        const callerConn = connectedUsersMap.get(fromUserId);
+        if (!callerConn) return;
+        
+        if (accepted) {
+            // Send acceptance
+            io.to(callerConn.socketId).emit('call_accepted', {
+                by_user_id: socket.user.id,
+                by_username: socket.user.username,
+                room_id: roomId,
+                timestamp: nowIso()
+            });
+            
+            // Add user to room if not already
+            if (!roomMembers.find(rm => rm.room_id === roomId && rm.user_id === socket.user.id)) {
+                roomMembers.push({
+                    id: roomMembers.length + 1,
+                    room_id: roomId,
+                    user_id: socket.user.id,
+                    role: 'member',
+                    joined_at: nowIso(),
+                    muted_until: null,
+                    is_banned: false
+                });
+            }
+            
+            // Join socket room
+            socket.join(`room_${roomId}`);
+            
+            // Update user connection tracking
+            const userConn = connectedUsersMap.get(socket.user.id);
+            if (userConn) {
+                userConn.rooms.add(roomId);
+            }
+            
+        } else {
+            // Send rejection
+            io.to(callerConn.socketId).emit('call_rejected', {
+                by_user_id: socket.user.id,
+                by_username: socket.user.username,
+                timestamp: nowIso()
+            });
+        }
+        
+    } catch (error) {
+        console.error('Incoming call response error:', error);
+    }
+});
+    // ===== Voice Call Events =====
+socket.on('voice_call_request', (data) => {
+    try {
+        const { to_user_id, call_type } = data;
+        const targetUserId = mustInt(to_user_id);
+        
+        // Find target user connection
+        const targetConn = connectedUsersMap.get(targetUserId);
+        if (!targetConn) {
+            return socket.emit('call_error', { error: 'User is offline' });
+        }
+        
+        // Send call request to target user
+        io.to(targetConn.socketId).emit('incoming_call', {
+            from_user_id: socket.user.id,
+            from_username: socket.user.username,
+            from_avatar: socket.user.avatar_url,
+            call_type: call_type || 'voice',
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice call request error:', error);
+        socket.emit('call_error', { error: 'Failed to send call request' });
+    }
+});
+
+socket.on('call_response', (data) => {
+    try {
+        const { to_user_id, accepted, room_id } = data;
+        const targetUserId = mustInt(to_user_id);
+        
+        const targetConn = connectedUsersMap.get(targetUserId);
+        if (!targetConn) return;
+        
+        if (accepted) {
+            // Send acceptance to caller
+            io.to(targetConn.socketId).emit('call_accepted', {
+                by_user_id: socket.user.id,
+                by_username: socket.user.username,
+                room_id: room_id,
+                timestamp: nowIso()
+            });
+            
+            // Create a voice room if needed
+            if (!room_id) {
+                // Create temporary voice room
+                const tempRoomId = rooms.length + 1;
+                const tempRoom = {
+                    id: tempRoomId,
+                    name: `مكالمة: ${socket.user.username} & ${users.find(u => u.id === targetUserId)?.username}`,
+                    description: 'مكالمة خاصة',
+                    type: 'voice',
+                    icon: '🎤',
+                    owner_id: socket.user.id,
+                    price_points: 0,
+                    max_members: 2,
+                    voice_seats: 2,
+                    settings_json: JSON.stringify({}),
+                    created_at: nowIso(),
+                    updated_at: nowIso()
+                };
+                rooms.push(tempRoom);
+                
+                // Add participants as room members
+                [socket.user.id, targetUserId].forEach(userId => {
+                    if (!roomMembers.find(rm => rm.room_id === tempRoomId && rm.user_id === userId)) {
+                        roomMembers.push({
+                            id: roomMembers.length + 1,
+                            room_id: tempRoomId,
+                            user_id: userId,
+                            role: 'member',
+                            joined_at: nowIso(),
+                            muted_until: null,
+                            is_banned: false,
+                            label_text: null,
+                            label_color: null
+                        });
+                    }
+                });
+                
+                // Notify both users about the new room
+                io.to(targetConn.socketId).emit('call_room_created', {
+                    room_id: tempRoomId,
+                    room_name: tempRoom.name
+                });
+                
+                socket.emit('call_room_created', {
+                    room_id: tempRoomId,
+                    room_name: tempRoom.name
+                });
+            }
+        } else {
+            // Send rejection to caller
+            io.to(targetConn.socketId).emit('call_rejected', {
+                by_user_id: socket.user.id,
+                by_username: socket.user.username,
+                timestamp: nowIso()
+            });
+        }
+        
+    } catch (error) {
+        console.error('Call response error:', error);
+        socket.emit('call_error', { error: 'Failed to process call response' });
+    }
+});
+
+socket.on('voice_call_started', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Notify all room members about voice call
+        io.to(`room_${roomId}`).emit('voice_call_active', {
+            room_id: roomId,
+            started_by: socket.user.id,
+            started_by_name: socket.user.username,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice call started error:', error);
+    }
+});
+
+socket.on('voice_call_ended', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Notify all room members that call ended
+        io.to(`room_${roomId}`).emit('voice_call_ended', {
+            room_id: roomId,
+            ended_by: socket.user.id,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice call ended error:', error);
+    }
+});
+
+// ===== Voice Activity Detection =====
+socket.on('voice_activity', (data) => {
+    try {
+        const { room_id, is_speaking, audio_level } = data;
+        const roomId = mustInt(room_id);
+        
+        // Broadcast voice activity to room members
+        socket.to(`room_${roomId}`).emit('user_voice_activity', {
+            user_id: socket.user.id,
+            username: socket.user.username,
+            is_speaking: is_speaking,
+            audio_level: audio_level || 0,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice activity error:', error);
+    }
+});
+
+// ===== Screen Sharing Events =====
+socket.on('screen_share_start', (data) => {
+    try {
+        const { room_id, stream_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Broadcast screen sharing start
+        io.to(`room_${roomId}`).emit('screen_share_started', {
+            user_id: socket.user.id,
+            username: socket.user.username,
+            stream_id: stream_id,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Screen share start error:', error);
+    }
+});
+
+socket.on('screen_share_stop', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Broadcast screen sharing stop
+        io.to(`room_${roomId}`).emit('screen_share_stopped', {
+            user_id: socket.user.id,
+            username: socket.user.username,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Screen share stop error:', error);
+    }
+});
+
+// ===== Push-to-Talk Events =====
+socket.on('push_to_talk_start', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Broadcast push-to-talk start
+        socket.to(`room_${roomId}`).emit('user_push_to_talk', {
+            user_id: socket.user.id,
+            username: socket.user.username,
+            talking: true,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Push to talk start error:', error);
+    }
+});
+
+socket.on('push_to_talk_stop', (data) => {
+    try {
+        const { room_id } = data;
+        const roomId = mustInt(room_id);
+        
+        // Broadcast push-to-talk stop
+        socket.to(`room_${roomId}`).emit('user_push_to_talk', {
+            user_id: socket.user.id,
+            username: socket.user.username,
+            talking: false,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Push to talk stop error:', error);
+    }
+});
     // ===== Room Events =====
     socket.on('join_room', (data) => {
         try {
@@ -2871,7 +3423,40 @@ io.on('connection', (socket) => {
         }
     });
 });
+// ===== Connection Status Updates =====
+function updateUserOnlineStatus(userId, isOnline) {
+    try {
+        // Update user last seen
+        const userIndex = users.findIndex(u => u.id === userId);
+        if (userIndex !== -1) {
+            users[userIndex].last_seen = nowIso();
+            
+            // Notify all rooms user is in
+            const userConn = connectedUsersMap.get(userId);
+            if (userConn) {
+                userConn.rooms.forEach(roomId => {
+                    io.to(`room_${roomId}`).emit('user_connection_update', {
+                        user_id: userId,
+                        is_online: isOnline,
+                        last_seen: nowIso()
+                    });
+                });
+            }
+        }
+    } catch (error) {
+        console.error('Update online status error:', error);
+    }
+}
 
+// تحديث حالة الاتصال عند الاتصال
+socket.on('user_online', () => {
+    updateUserOnlineStatus(socket.user.id, true);
+});
+
+// تحديث حالة الاتصال عند الانقطاع
+socket.on('disconnect', () => {
+    updateUserOnlineStatus(socket.user.id, false);
+});
 // ================== BOT COMMAND PROCESSING ==================
 function processBotCommand(command, args, user, roomId, socket) {
     command = command.toLowerCase();
