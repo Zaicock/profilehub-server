@@ -1959,6 +1959,94 @@ io.on('connection', (socket) => {
         user_id: socket.user.id,
         username: socket.user.username
     });
+    // ===== أحداث الصوت =====
+socket.on('voice_call_start', (data) => {
+    try {
+        const { room_id, call_type } = data;
+        
+        // إعلام جميع أعضاء الغرفة
+        socket.to(`room_${room_id}`).emit('voice_call_incoming', {
+            room_id: room_id,
+            caller_id: socket.user.id,
+            caller_name: socket.user.username,
+            call_type: call_type,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice call start error:', error);
+    }
+});
+
+socket.on('voice_join_call', (data) => {
+    try {
+        const { room_id, user_id, username } = data;
+        
+        // إعلام جميع أعضاء الغرة
+        socket.to(`room_${room_id}`).emit('user_joined_call', {
+            room_id: room_id,
+            user_id: user_id,
+            username: username,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice join call error:', error);
+    }
+});
+
+socket.on('voice_call_end', (data) => {
+    try {
+        const { room_id } = data;
+        
+        // إعلام جميع أعضاء الغرفة
+        io.to(`room_${room_id}`).emit('voice_call_ended', {
+            room_id: room_id,
+            ended_by: socket.user.id,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice call end error:', error);
+    }
+});
+
+socket.on('voice_mute_status', (data) => {
+    try {
+        const { room_id, muted } = data;
+        
+        // إعلام جميع أعضاء الغرفة
+        socket.to(`room_${room_id}`).emit('user_mute_changed', {
+            room_id: room_id,
+            user_id: socket.user.id,
+            username: socket.user.username,
+            muted: muted,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice mute status error:', error);
+    }
+});
+
+socket.on('voice_activity', (data) => {
+    try {
+        const { room_id, speaking, level } = data;
+        
+        // إعلام جميع أعضاء الغرفة
+        socket.to(`room_${room_id}`).emit('user_speaking', {
+            room_id: room_id,
+            user_id: socket.user.id,
+            username: socket.user.username,
+            speaking: speaking,
+            level: level || 0,
+            timestamp: nowIso()
+        });
+        
+    } catch (error) {
+        console.error('Voice activity error:', error);
+    }
+});
 // ===== Enhanced WebRTC Events =====
 socket.on('webrtc_offer', (data) => {
     try {
