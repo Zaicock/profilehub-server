@@ -1177,7 +1177,40 @@ app.post('/api/points/grant', authMiddleware, (req, res) => {
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
+// ===== دالة إرسال رسالة بوت =====
+function sendBotMessageToRoom(roomId, message, senderName = '💰 نظام النقاط') {
+    try {
+        // 1. إنشاء كائن الرسالة
+        const botMessage = {
+            id: messages.length + 1,
+            room_id: roomId,
+            user_id: 0, // 0 يعني بوت النظام
+            username: senderName,
+            avatar_url: 'https://ui-avatars.com/api/?name=Bot&background=007AFF&color=fff',
+            text: message,
+            message_type: 'system',
+            edited: false,
+            deleted: false,
+            created_at: nowIso(),
+            updated_at: nowIso()
+        };
 
+        // 2. حفظ الرسالة في الذاكرة
+        messages.push(botMessage);
+
+        // 3. بث الرسالة لجميع المتصلين في الغرفة
+        io.to(`room_${roomId}`).emit('chat', { 
+            message: botMessage 
+        });
+
+        console.log(`✅ تم بث رسالة بوت في الغرفة ${roomId}`);
+        return true;
+        
+    } catch (error) {
+        console.error('❌ فشل بث رسالة البوت:', error);
+        return false;
+    }
+}
 app.post('/api/points/transfer', authMiddleware, (req, res) => {
     try {
         const { to_user_id, amount, reason } = req.body;
@@ -1248,7 +1281,7 @@ app.post('/api/points/transfer', authMiddleware, (req, res) => {
             sender_new_balance: users[senderIndex]?.points,
             receiver_new_balance: users[receiverIndex]?.points
         });
-        
+        sendBotMessageToRoom(1, `🎉 ${req.user.username} أرسل ${transferAmount} نقطة إلى ${targetUser.username}${reason ? ` (${reason})` : ''}`);
         res.json({
             ok: true,
             message: 'تم تحويل النقاط بنجاح',
