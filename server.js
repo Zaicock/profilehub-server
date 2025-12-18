@@ -1534,6 +1534,95 @@ app.get('/api/search/users', authMiddleware, (req, res) => {
 });
 
 // ===== Subscriptions & Payment =====
+app.post('/api/subscriptions/subscribe', authMiddleware, (req, res) => {
+    try {
+        const { plan_id, payment_method, payment_data } = req.body;
+        
+        if (!plan_id) {
+            return res.status(400).json({ ok: false, error: 'PLAN_ID_REQUIRED' });
+        }
+        
+        // Find the subscription plan
+        const plan = subscriptions.find(s => s.id === plan_id);
+        if (!plan) {
+            return res.status(404).json({ ok: false, error: 'PLAN_NOT_FOUND' });
+        }
+        
+        // Check payment method
+        const paymentMethod = paymentMethods.find(pm => pm.id === payment_method);
+        if (!paymentMethod) {
+            return res.status(400).json({ ok: false, error: 'PAYMENT_METHOD_INVALID' });
+        }
+        
+        // Process payment based on method
+        if (paymentMethod.provider === 'points') {
+            // Check if user has enough points
+            if (req.user.points < plan.price_points) {
+                return res.status(400).json({ 
+                    ok: false, 
+                    error: 'INSUFFICIENT_POINTS',
+                    required: plan.price_points,
+                    current: req.user.points 
+                });
+            }
+            
+            // Deduct points
+            req.user.points -= plan.price_points;
+            
+            // Record transaction
+            pointTransactions.push({
+                id: pointTransactions.length + 1,
+                from_user_id: req.user.id,
+                to_user_id: null, // System
+                amount: plan.price_points,
+                reason: `Subscribe to ${plan.name}`,
+                created_at: nowIso()
+            });
+        }
+        // For other payment methods (Stripe, PayPal) you would integrate with their APIs
+        
+        // Calculate expiration date
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + plan.duration_days);
+        
+        // Create user subscription
+        const userSubscription = {
+            id: userSubscriptions.length + 1,
+            user_id: req.user.id,
+            plan_id: plan.id,
+            payment_method_id: payment_method,
+            amount_paid: plan.price_usd,
+            points_paid: plan.price_points,
+            status: 'active',
+            starts_at: nowIso(),
+            expires_at: expiresAt.toISOString(),
+            created_at: nowIso()
+        };
+        
+        userSubscriptions.push(userSubscription);
+        
+        // Update user's subscription status
+        const userIndex = users.findIndex(u => u.id === req.user.id);
+        if (userIndex !== -1) {
+            users[userIndex].subscription_plan = plan.plan_key;
+            users[userIndex].subscription_expires = expiresAt.toISOString();
+        }
+        
+        res.json({
+            ok: true,
+            message: 'Subscription activated successfully',
+            subscription: {
+                plan: plan.name,
+                expires_at: expiresAt.toISOString(),
+                next_billing: expiresAt.toISOString()
+            }
+        });
+        
+    } catch (error) {
+        console.error('Subscribe error:', error);
+        res.status(500).json({ ok: false, error: 'SUBSCRIPTION_FAILED' });
+    }
+});
 app.get('/api/subscriptions', authMiddleware, (req, res) => {
     try {
         res.json({
@@ -2525,13 +2614,18 @@ io.on('connection', (socket) => {
     });
     
     // ===== System Events =====
+
+
     socket.on('get_room_data', (data) => {
         try {
             const roomId = mustInt(data.room_id);
-            
             const room = rooms.find(r => r.id === roomId);
-            if (!room) return;
             
+            if (!room) {
+                return socket.emit('error', { error: 'Room not found' });
+            }
+            
+            // Get room members with online status
             const roomUsers = roomMembers
                 .filter(rm => rm.room_id === roomId && !rm.is_banned)
                 .map(rm => {
@@ -2541,27 +2635,49 @@ io.on('connection', (socket) => {
                         ...rm,
                         username: user?.username,
                         avatar_url: user?.avatar_url,
-                        is_online: isOnline
+                        is_online: isOnline,
+                        is_developer: user?.is_developer,
+                        verified: user?.verified,
+                        frame_id: user?.frame_id,
+                        points: user?.points
                     };
                 });
             
+            // Send members snapshot
             socket.emit('members_snapshot', {
                 room_id: roomId,
                 members: roomUsers
             });
             
+            // Send seats snapshot if voice room
             if (room.type === 'voice') {
+                const seats = voiceSeats
+                    .filter(vs => vs.room_id === roomId)
+                    .map(vs => ({
+                        ...vs,
+                        username: vs.user_id ? users.find(u => u.id === vs.user_id)?.username : null,
+                        avatar_url: vs.user_id ? users.find(u => u.id === vs.user_id)?.avatar_url : null
+                    }));
+                
                 socket.emit('seats_snapshot', {
                     room_id: roomId,
-                    seats: voiceSeats.filter(vs => vs.room_id === roomId)
+                    seats: seats
                 });
             }
             
+            // Send room settings
+            socket.emit('room_settings', {
+                room_id: roomId,
+                settings: safeJsonParse(room.settings_json) || {},
+                chat_locked: (safeJsonParse(room.settings_json) || {}).chat_locked || false,
+                auto_delete_limit: (safeJsonParse(room.settings_json) || {}).auto_delete_limit || 0
+            });
+            
         } catch (error) {
             console.error('Get room data error:', error);
+            socket.emit('error', { error: 'Failed to get room data' });
         }
     });
-    
     // ===== Heartbeat/Presence =====
     socket.on('heartbeat', () => {
         try {
