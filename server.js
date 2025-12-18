@@ -1178,6 +1178,98 @@ app.post('/api/points/grant', authMiddleware, (req, res) => {
     }
 });
 
+app.post('/api/points/transfer', authMiddleware, (req, res) => {
+    try {
+        const { to_user_id, amount, reason } = req.body;
+        
+        console.log('=== نقاط: تحويل نقاط ===');
+        console.log('من:', req.user.username, 'ID:', req.user.id);
+        console.log('إلى:', to_user_id);
+        console.log('المبلغ:', amount);
+        console.log('السبب:', reason);
+        
+        // تحويل البيانات لأرقام
+        const targetUserId = parseInt(to_user_id);
+        const transferAmount = parseInt(amount);
+        
+        // التحقق من البيانات
+        if (!targetUserId || !transferAmount || transferAmount < 1) {
+            return res.status(400).json({ 
+                ok: false, 
+                error: 'INVALID_TRANSFER_DATA' 
+            });
+        }
+        
+        // البحث عن المستخدم الهدف
+        const targetUser = users.find(u => u.id === targetUserId);
+        if (!targetUser) {
+            return res.status(404).json({ 
+                ok: false, 
+                error: 'TARGET_USER_NOT_FOUND' 
+            });
+        }
+        
+        // التحقق من رصيد المستخدم الحالي
+        if (req.user.points < transferAmount) {
+            return res.status(400).json({ 
+                ok: false, 
+                error: 'INSUFFICIENT_POINTS',
+                current_points: req.user.points,
+                required_points: transferAmount
+            });
+        }
+        
+        // تنفيذ التحويل
+        const senderIndex = users.findIndex(u => u.id === req.user.id);
+        const receiverIndex = users.findIndex(u => u.id === targetUserId);
+        
+        if (senderIndex !== -1) {
+            users[senderIndex].points -= transferAmount;
+        }
+        
+        if (receiverIndex !== -1) {
+            users[receiverIndex].points += transferAmount;
+        }
+        
+        // تسجيل المعاملة
+        pointTransactions.push({
+            id: pointTransactions.length + 1,
+            from_user_id: req.user.id,
+            to_user_id: targetUserId,
+            amount: transferAmount,
+            reason: reason || `تحويل نقاط من ${req.user.username}`,
+            created_at: nowIso()
+        });
+        
+        console.log('✅ تحويل ناجح:', {
+            sender: req.user.username,
+            receiver: targetUser.username,
+            amount: transferAmount,
+            sender_new_balance: users[senderIndex]?.points,
+            receiver_new_balance: users[receiverIndex]?.points
+        });
+        
+        res.json({
+            ok: true,
+            message: 'تم تحويل النقاط بنجاح',
+            data: {
+                sender_id: req.user.id,
+                receiver_id: targetUserId,
+                amount: transferAmount,
+                sender_new_balance: users[senderIndex]?.points,
+                receiver_new_balance: users[receiverIndex]?.points
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ خطأ في تحويل النقاط:', error);
+        res.status(500).json({ 
+            ok: false, 
+            error: 'TRANSFER_FAILED',
+            details: error.message 
+        });
+    }
+});
 app.post('/api/points/deduct', authMiddleware, (req, res) => {
     try {
         const { to_user_id, amount, reason } = req.body;
