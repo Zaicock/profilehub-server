@@ -3379,11 +3379,17 @@ socket.on('push_to_talk_stop', (data) => {
             console.error('Heartbeat error:', error);
         }
     });
-    
+    // تحديث حالة الاتصال عند الاتصال
+    socket.on('user_online', () => {
+    updateUserOnlineStatus(socket.user.id, true);
+});
     // ===== Disconnection =====
     socket.on('disconnect', () => {
         try {
             console.log(`🔌 User disconnected: ${socket.user?.username} (ID: ${socket.id})`);
+             
+        // تحديث حالة الاتصال عند الانقطاع
+            updateUserOnlineStatus(socket.user.id, false);
             
             const userConn = connectedUsersMap.get(socket.user.id);
             if (userConn) {
@@ -3448,15 +3454,8 @@ function updateUserOnlineStatus(userId, isOnline) {
     }
 }
 
-// تحديث حالة الاتصال عند الاتصال
-socket.on('user_online', () => {
-    updateUserOnlineStatus(socket.user.id, true);
-});
 
-// تحديث حالة الاتصال عند الانقطاع
-socket.on('disconnect', () => {
-    updateUserOnlineStatus(socket.user.id, false);
-});
+
 // ================== BOT COMMAND PROCESSING ==================
 function processBotCommand(command, args, user, roomId, socket) {
     command = command.toLowerCase();
