@@ -739,7 +739,118 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
+// ===== إطارات المستخدم =====
+app.get('/api/user/frames', authMiddleware, (req, res) => {
+  try {
+    const userFramesList = userFrames
+      .filter(uf => uf.user_id === req.user.id)
+      .map(uf => {
+        const frame = frames.find(f => f.id === uf.frame_id);
+        return frame ? { ...frame, purchased_at: uf.purchased_at } : null;
+      })
+      .filter(Boolean);
+    
+    res.json({
+      ok: true,
+      frames: userFramesList
+    });
+    
+  } catch (error) {
+    console.error('Get user frames error:', error);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
 
+app.post('/api/frames/purchase', authMiddleware, (req, res) => {
+  try {
+    const { frame_id } = req.body;
+    const frameId = mustInt(frame_id);
+    
+    const frame = frames.find(f => f.id === frameId);
+    if (!frame) {
+      return res.status(404).json({ ok: false, error: 'FRAME_NOT_FOUND' });
+    }
+    
+    // التحقق إذا كان المستخدم يملك الإطار بالفعل
+    const alreadyOwned = userFrames.some(uf => 
+      uf.user_id === req.user.id && uf.frame_id === frameId
+    );
+    
+    if (alreadyOwned) {
+      return res.status(400).json({ ok: false, error: 'FRAME_ALREADY_OWNED' });
+    }
+    
+    // التحقق من توفر النقاط
+    if (req.user.points < frame.price_points) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'INSUFFICIENT_POINTS',
+        required: frame.price_points,
+        current: req.user.points
+      });
+    }
+    
+    // خصم النقاط
+    const userIndex = users.findIndex(u => u.id === req.user.id);
+    users[userIndex].points -= frame.price_points;
+    
+    // إضافة الإطار للمستخدم
+    userFrames.push({
+      id: userFrames.length + 1,
+      user_id: req.user.id,
+      frame_id: frameId,
+      purchased_at: nowIso()
+    });
+    
+    // تسجيل العملية
+    pointTransactions.push({
+      id: pointTransactions.length + 1,
+      from_user_id: req.user.id,
+      to_user_id: null,
+      amount: frame.price_points,
+      reason: `شراء إطار: ${frame.name}`,
+      created_at: nowIso()
+    });
+    
+    res.json({
+      ok: true,
+      message: 'Frame purchased successfully',
+      data: {
+        frame: frame,
+        user_points: users[userIndex].points
+      }
+    });
+    
+  } catch (error) {
+    console.error('Purchase frame error:', error);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// ===== WebSocket Frame Update =====
+// في جزء WebSocket، أضف هذا الحدث:
+socket.on('frame_update', (data) => {
+  try {
+    const { user_id, frame_id } = data;
+    const userId = mustInt(user_id);
+    const frameId = mustInt(frame_id);
+    
+    // تحديث إطار المستخدم في جميع الغرف المشترك فيها
+    const userConn = connectedUsersMap.get(userId);
+    if (userConn) {
+      userConn.rooms.forEach(roomId => {
+        io.to(`room_${roomId}`).emit('user_frame_updated', {
+          user_id: userId,
+          frame_id: frameId,
+          timestamp: nowIso()
+        });
+      });
+    }
+    
+  } catch (error) {
+    console.error('Frame update error:', error);
+  }
+});
 // ===== Profile Routes =====
 app.get('/api/profile', authMiddleware, (req, res) => {
     try {
@@ -1790,7 +1901,80 @@ app.get('/api/search/users', authMiddleware, (req, res) => {
         res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
 });
-
+// ===== إضافة هذا الكود بعد route frames/select =====
+app.post('/api/frames/purchase', authMiddleware, (req, res) => {
+    try {
+        const { frame_id } = req.body;
+        const frameId = mustInt(frame_id);
+        
+        // 1. البحث عن الإطار
+        const frame = frames.find(f => f.id === frameId);
+        if (!frame) {
+            return res.status(404).json({ ok: false, error: 'FRAME_NOT_FOUND' });
+        }
+        
+        // 2. التحقق من التوفر
+        if (!frame.available) {
+            return res.status(400).json({ ok: false, error: 'FRAME_NOT_AVAILABLE' });
+        }
+        
+        // 3. التحقق من الملكية السابقة
+        const alreadyOwned = userFrames.find(uf => 
+            uf.user_id === req.user.id && uf.frame_id === frameId
+        );
+        
+        if (alreadyOwned) {
+            return res.status(400).json({ ok: false, error: 'FRAME_ALREADY_OWNED' });
+        }
+        
+        // 4. التحقق من الرصيد
+        if (req.user.points < frame.price_points) {
+            return res.status(400).json({ 
+                ok: false, 
+                error: 'INSUFFICIENT_POINTS',
+                required: frame.price_points,
+                current: req.user.points
+            });
+        }
+        
+        // 5. خصم النقاط
+        const userIndex = users.findIndex(u => u.id === req.user.id);
+        users[userIndex].points -= frame.price_points;
+        
+        // 6. إضافة الإطار للمستخدم
+        userFrames.push({
+            id: userFrames.length + 1,
+            user_id: req.user.id,
+            frame_id: frameId,
+            purchased_at: nowIso()
+        });
+        
+        // 7. تسجيل المعاملة
+        pointTransactions.push({
+            id: pointTransactions.length + 1,
+            from_user_id: req.user.id,
+            to_user_id: null, // النظام
+            amount: frame.price_points,
+            reason: `شراء إطار: ${frame.name}`,
+            created_at: nowIso()
+        });
+        
+        // 8. الرد الناجح
+        res.json({
+            ok: true,
+            message: 'تم شراء الإطار بنجاح',
+            data: {
+                frame_id: frameId,
+                frame_name: frame.name,
+                user_points: users[userIndex].points
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ خطأ في شراء الإطار:', error);
+        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+});
 // ===== Subscriptions & Payment =====
 app.post('/api/subscriptions/subscribe', authMiddleware, (req, res) => {
     try {
