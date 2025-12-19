@@ -589,7 +589,8 @@ app.get('/', (req, res) => {
             'POST   /api/rooms/:id/autodelete',
             'GET    /api/rooms/:id/bots',
             'POST   /api/bots',
-            'POST   /api/bots/:id/commands'
+            'POST   /api/bots/:id/commands',
+            'GET    /api/users/:id'
         ]
     });
 });
@@ -826,7 +827,76 @@ app.post('/api/frames/purchase', authMiddleware, (req, res) => {
     res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
 });
-
+app.get('/api/users/:id', authenticate, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    // 1. تحقق من صحة المعرف
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'معرف مستخدم غير صالح'
+      });
+    }
+    
+    // 2. جلب المستخدم من قاعدة البيانات
+    const user = await db.User.findOne({
+      where: { id: userId },
+      attributes: [
+        'id', 'username', 'email', 'avatar_url', 'bio', 
+        'points', 'subscription_tier', 'subscription_expires',
+        'verified', 'is_developer', 'is_online', 'last_seen',
+        'created_at', 'frame_id'
+      ]
+    });
+    
+    // 3. تحقق إذا كان المستخدم موجود
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        error: 'المستخدم غير موجود'
+      });
+    }
+    
+    // 4. جلب الإطار المختار إذا كان موجوداً
+    let frame = null;
+    if (user.frame_id) {
+      frame = await db.Frame.findOne({
+        where: { id: user.frame_id },
+        attributes: ['id', 'name', 'image_url', 'category']
+      });
+    }
+    
+    // 5. إرسال الرد
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email || null,
+        avatar_url: user.avatar_url || `https://ui-avatars.com/api/?name=${user.username}&background=007AFF&color=fff&size=150`,
+        bio: user.bio || 'لم تتم إضافة نبذة تعريفية',
+        points: user.points || 0,
+        subscription_tier: user.subscription_tier || 'basic',
+        subscription_expires: user.subscription_expires || null,
+        verified: Boolean(user.verified),
+        is_developer: Boolean(user.is_developer),
+        is_online: Boolean(user.is_online),
+        last_seen: user.last_seen || user.updated_at,
+        created_at: user.created_at,
+        frame: frame,
+        frame_id: user.frame_id
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ خطأ في جلب بيانات المستخدم:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'خطأ في الخادم'
+    });
+  }
+});
 // ===== Profile Routes =====
 app.get('/api/profile', authMiddleware, (req, res) => {
     try {
