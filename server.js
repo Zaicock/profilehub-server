@@ -827,30 +827,6 @@ app.post('/api/frames/purchase', authMiddleware, (req, res) => {
   }
 });
 
-// ===== WebSocket Frame Update =====
-// في جزء WebSocket، أضف هذا الحدث:
-socket.on('frame_update', (data) => {
-  try {
-    const { user_id, frame_id } = data;
-    const userId = mustInt(user_id);
-    const frameId = mustInt(frame_id);
-    
-    // تحديث إطار المستخدم في جميع الغرف المشترك فيها
-    const userConn = connectedUsersMap.get(userId);
-    if (userConn) {
-      userConn.rooms.forEach(roomId => {
-        io.to(`room_${roomId}`).emit('user_frame_updated', {
-          user_id: userId,
-          frame_id: frameId,
-          timestamp: nowIso()
-        });
-      });
-    }
-    
-  } catch (error) {
-    console.error('Frame update error:', error);
-  }
-});
 // ===== Profile Routes =====
 app.get('/api/profile', authMiddleware, (req, res) => {
     try {
@@ -2143,6 +2119,30 @@ io.on('connection', (socket) => {
         user_id: socket.user.id,
         username: socket.user.username
     });
+// ===== WebSocket Frame Update =====
+// في جزء WebSocket، أضف هذا الحدث:
+socket.on('frame_update', (data) => {
+  try {
+    const { user_id, frame_id } = data;
+    const userId = mustInt(user_id);
+    const frameId = mustInt(frame_id);
+    
+    // تحديث إطار المستخدم في جميع الغرف المشترك فيها
+    const userConn = connectedUsersMap.get(userId);
+    if (userConn) {
+      userConn.rooms.forEach(roomId => {
+        io.to(`room_${roomId}`).emit('user_frame_updated', {
+          user_id: userId,
+          frame_id: frameId,
+          timestamp: nowIso()
+        });
+      });
+    }
+    
+  } catch (error) {
+    console.error('Frame update error:', error);
+  }
+});
     // ===== أحداث الصوت =====
 socket.on('voice_call_start', (data) => {
     try {
