@@ -1464,37 +1464,7 @@ app.post('/api/rooms/:id/start-call', authMiddleware, (req, res) => {
 });
 
 // ===== New Message Endpoint =====
-app.get('/api/rooms/:id/messages', authMiddleware, (req, res) => {
-    try {
-        const roomId = parseInt(req.params.id);
-
-        // Find room
-        const room = rooms.find(r => r.id === roomId);
-        if (!room) {
-            return res.status(404).json({ ok: false, error: 'ROOM_NOT_FOUND' });
-        }
-
-        // Check membership
-        const isMember = room.members.some(m => m.user_id === req.user.id);
-        if (!isMember) {
-            // Auto-join or forbidden?
-            // If public, maybe allow reading? For now, 403.
-            return res.status(403).json({ ok: false, error: 'NOT_MEMBER' });
-        }
-
-        // Return mock messages or empty for now since we don't persist them in this array structure yet
-        // In a real app, you'd fetch from DB.
-        // We'll return an empty array or recent in-memory messages if we had them.
-        res.json({
-            ok: true,
-            messages: []
-        });
-
-    } catch (error) {
-        console.error('Get messages error:', error);
-        res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
-});
+// Redundant message route removed
 
 app.post('/api/voice/end-call', authMiddleware, (req, res) => {
     try {
@@ -3063,6 +3033,8 @@ io.on('connection', (socket) => {
                 room_id: roomId,
                 user_id: socket.user.id,
                 username: socket.user.username,
+                avatar_url: socket.user.avatar_url,
+                frame_id: socket.user.frame_id,
                 text: text.trim(),
                 message_type: message_type || 'text',
                 metadata_json: metadata ? JSON.stringify(metadata) : '{}',
@@ -3804,7 +3776,8 @@ io.on('connection', (socket) => {
                     .map(vs => ({
                         ...vs,
                         username: vs.user_id ? users.find(u => u.id === vs.user_id)?.username : null,
-                        avatar_url: vs.user_id ? users.find(u => u.id === vs.user_id)?.avatar_url : null
+                        avatar_url: vs.user_id ? users.find(u => u.id === vs.user_id)?.avatar_url : null,
+                        frame_id: vs.user_id ? users.find(u => u.id === vs.user_id)?.frame_id : null
                     }));
 
                 socket.emit('seats_snapshot', {
@@ -3879,7 +3852,12 @@ io.on('connection', (socket) => {
                         // Broadcast seats snapshot
                         io.to(`room_${roomId}`).emit('seats_snapshot', {
                             room_id: roomId,
-                            seats: voiceSeats.filter(vs => vs.room_id === roomId)
+                            seats: voiceSeats.filter(vs => vs.room_id === roomId).map(vs => ({
+                                ...vs,
+                                username: vs.user_id ? users.find(u => u.id === vs.user_id)?.username : null,
+                                avatar_url: vs.user_id ? users.find(u => u.id === vs.user_id)?.avatar_url : null,
+                                frame_id: vs.user_id ? users.find(u => u.id === vs.user_id)?.frame_id : null
+                            }))
                         });
                     }
 
